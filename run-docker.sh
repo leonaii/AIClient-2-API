@@ -88,8 +88,8 @@ fi
 echo ""
 
 # ========== 凭证路径设置 ==========
-AWS_SSO_CACHE_PATH="$HOME/.aws/sso/cache"
-GEMINI_CONFIG_PATH="$HOME/.gemini/oauth_creds.json"
+AWS_SSO_CACHE_PATH="/home/aiclient/cache/.aws/sso/cache"
+GEMINI_CONFIG_PATH="/home/aiclient/cache/.gemini/oauth_creds.json"
 
 # 检查 AWS SSO 缓存目录
 if [ -d "$AWS_SSO_CACHE_PATH" ]; then
