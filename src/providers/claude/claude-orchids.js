@@ -1,18 +1,23 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { promises as fs } from 'fs';
+import * as path from 'path';
+import { spawn } from 'child_process';
 import WebSocket from 'ws';
 import axios from 'axios';
 import { getProviderModels } from '../provider-models.js';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
 import { CredentialCacheManager } from '../../utils/credential-cache-manager.js';
+import { countTokens as anthropicCountTokens } from '@anthropic-ai/tokenizer';
 
 // ============================================================================
 // 常量定义
 // ============================================================================
 
 const ORCHIDS_CONSTANTS = {
-    WS_URL: 'wss://orchids-v2-alpha-108292236521.europe-west1.run.app/agent/ws/coding-agent',
+    API_BASE_URL: 'https://orchids-server.calmstone-6964e08a.westeurope.azurecontainerapps.io/',
+    ORCHIDS_API_VERSION: '2',
+    DEFAULT_ENDPOINT: 'coding-agent',
     CLERK_TOKEN_URL: 'https://clerk.orchids.app/v1/client/sessions/{sessionId}/tokens',
     CLERK_CLIENT_URL: 'https://clerk.orchids.app/v1/client',
     CLERK_JS_VERSION: '5.114.0',
@@ -20,6 +25,15 @@ const ORCHIDS_CONSTANTS = {
     USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     ORIGIN: 'https://www.orchids.app',
     DEFAULT_MODEL: 'claude-sonnet-4-5',
+};
+
+// Thinking 相关常量（参考 Kiro 实现）
+const ORCHIDS_THINKING = {
+    DEFAULT_BUDGET_TOKENS: 10000,
+    MIN_BUDGET_TOKENS: 1024,
+    MAX_BUDGET_TOKENS: 128000,
+    MODE_TAG: '<thinking_mode>',
+    MAX_LEN_TAG: '<max_thinking_length>',
 };
 
 // 从 provider-models.js 获取支持的模型列表
@@ -58,6 +72,7 @@ export class OrchidsApiService {
         
         // axios 实例
         this.axiosInstance = null;
+        this.backgroundProcesses = new Map();
         
     }
 
@@ -312,6 +327,46 @@ export class OrchidsApiService {
         });
     }
 
+    // ========================================================================
+    // Thinking 支持方法（参考 Kiro 实现）
+    // ========================================================================
+
+    /**
+     * 规范化 thinking budget tokens
+     * @param {number} budgetTokens - 原始 budget tokens 值
+     * @returns {number} 规范化后的 budget tokens
+     */
+    _normalizeThinkingBudgetTokens(budgetTokens) {
+        let value = Number(budgetTokens);
+        if (!Number.isFinite(value) || value <= 0) {
+            value = ORCHIDS_THINKING.DEFAULT_BUDGET_TOKENS;
+        }
+        value = Math.max(value, ORCHIDS_THINKING.MIN_BUDGET_TOKENS);
+        value = Math.floor(value);
+        return Math.min(value, ORCHIDS_THINKING.MAX_BUDGET_TOKENS);
+    }
+
+    /**
+     * 生成 thinking 前缀
+     * @param {object} thinking - thinking 配置对象
+     * @returns {string|null} thinking 前缀字符串或 null
+     */
+    _generateThinkingPrefix(thinking) {
+        if (!thinking || thinking.type !== 'enabled') return null;
+        const budget = this._normalizeThinkingBudgetTokens(thinking.budget_tokens);
+        return `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>`;
+    }
+
+    /**
+     * 检查文本是否已包含 thinking 前缀
+     * @param {string} text - 要检查的文本
+     * @returns {boolean} 是否包含 thinking 前缀
+     */
+    _hasThinkingPrefix(text) {
+        if (!text) return false;
+        return text.includes(ORCHIDS_THINKING.MODE_TAG) || text.includes(ORCHIDS_THINKING.MAX_LEN_TAG);
+    }
+
     _extractSystemPrompt(messages) {
         if (!messages || messages.length === 0) return '';
         
@@ -334,36 +389,83 @@ export class OrchidsApiService {
         return systemPrompts.join('\n\n');
     }
 
+    /**
+     * 提取用户消息内容，保留 tool_result 的结构化信息
+     * @param {Array} messages - 消息数组
+     * @returns {Object} 包含 text 和 toolResults 的对象
+     */
     _extractUserMessage(messages) {
-        if (!messages || messages.length === 0) return '';
+        if (!messages || messages.length === 0) return { text: '', toolResults: [] };
         
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
             if (msg.role !== 'user') continue;
             
             const content = msg.content;
-            if (typeof content === 'string') return content;
+            if (typeof content === 'string') return { text: content, toolResults: [] };
             if (!Array.isArray(content)) continue;
             
-            const hasToolResult = content.some(block => block.type === 'tool_result');
-            if (hasToolResult) continue;
+            const textParts = [];
+            const toolResults = [];
             
+            for (const block of content) {
+                if (block.type === 'text') {
+                    const text = block.text || '';
+                    if (!text.includes('<system-reminder>') && text.trim()) {
+                        textParts.push(text);
+                    }
+                } else if (block.type === 'tool_result') {
+                    // 保留结构化的 tool_result 信息（参考 Kiro 实现）
+                    const toolResultContent = block.content || '';
+                    const contentText = typeof toolResultContent === 'string' 
+                        ? toolResultContent 
+                        : JSON.stringify(toolResultContent);
+                    
+                    toolResults.push({
+                        toolUseId: block.tool_use_id,
+                        content: { text: contentText },
+                        status: block.is_error ? 'error' : 'success'
+                    });
+                } else if (block.type === 'image') {
+                    const mediaType = block.source?.media_type || block.media_type || 'unknown';
+                    const sourceType = block.source?.type || 'unknown';
+                    const sizeHint = block.source?.data ? ` bytes≈${Math.floor(block.source.data.length * 0.75)}` : '';
+                    textParts.push(`[Image ${mediaType} ${sourceType}${sizeHint}]`);
+                } else if (block.type === 'document') {
+                    const sourceType = block.source?.type || 'unknown';
+                    const sizeHint = block.source?.data ? ` bytes≈${Math.floor(block.source.data.length * 0.75)}` : '';
+                    textParts.push(`[Document ${sourceType}${sizeHint}]`);
+                }
+            }
+            
+            const merged = textParts.join('\n').trim();
+            if (merged || toolResults.length > 0) {
+                return { text: merged, toolResults };
+            }
+            
+            // Fallback: 尝试从最后一个 text block 获取内容
             for (let j = content.length - 1; j >= 0; j--) {
                 const block = content[j];
                 if (block.type === 'text') {
                     const text = block.text || '';
                     if (!text.includes('<system-reminder>') && text.trim()) {
-                        return text;
+                        return { text, toolResults: [] };
                     }
                 }
             }
         }
         
-        return '';
+        return { text: '', toolResults: [] };
     }
 
+    /**
+     * 将消息转换为聊天历史格式，保留 tool_result 的结构化信息
+     * @param {Array} messages - 消息数组
+     * @returns {Object} 包含 chatHistory 和 toolResults 的对象
+     */
     _convertMessagesToChatHistory(messages) {
         const chatHistory = [];
+        const allToolResults = [];
         
         for (const msg of messages) {
             const role = msg.role;
@@ -378,6 +480,7 @@ export class OrchidsApiService {
             
             if (role === 'user') {
                 const textParts = [];
+                const toolResults = [];
                 
                 if (typeof content === 'string') {
                     textParts.push(content);
@@ -386,16 +489,37 @@ export class OrchidsApiService {
                         if (block.type === 'text') {
                             textParts.push(block.text || '');
                         } else if (block.type === 'tool_result') {
-                            const toolId = block.tool_use_id || 'unknown';
-                            const result = block.content || '';
-                            textParts.push(`[Tool Result ${toolId}]\n${result}`);
+                            // 保留结构化的 tool_result 信息（参考 Kiro 实现）
+                            const toolResultContent = block.content || '';
+                            const contentText = typeof toolResultContent === 'string' 
+                                ? toolResultContent 
+                                : JSON.stringify(toolResultContent);
+                            
+                            toolResults.push({
+                                toolUseId: block.tool_use_id,
+                                content: { text: contentText },
+                                status: block.is_error ? 'error' : 'success'
+                            });
+                        } else if (block.type === 'image') {
+                            const mediaType = block.source?.media_type || block.media_type || 'unknown';
+                            const sourceType = block.source?.type || 'unknown';
+                            textParts.push(`[Image ${mediaType} ${sourceType}]`);
+                        } else if (block.type === 'document') {
+                            const sourceType = block.source?.type || 'unknown';
+                            textParts.push(`[Document ${sourceType}]`);
                         }
                     }
                 }
                 
                 const text = textParts.join('\n');
+                // 只有当有实际文本内容时才添加到 chatHistory
+                // 空字符串会导致 Orchids API 报错 "The text field in the ContentBlock object is blank"
                 if (text) {
                     chatHistory.push({ role: 'user', content: text });
+                }
+                // 收集所有 toolResults（无论是否有文本）
+                if (toolResults.length > 0) {
+                    allToolResults.push(...toolResults);
                 }
             } else if (role === 'assistant') {
                 const textParts = [];
@@ -408,6 +532,13 @@ export class OrchidsApiService {
                             const toolName = block.name || 'unknown';
                             const toolInput = block.input || {};
                             textParts.push(`[Used tool: ${toolName} with input: ${JSON.stringify(toolInput)}]`);
+                        } else if (block.type === 'image') {
+                            const mediaType = block.source?.media_type || block.media_type || 'unknown';
+                            const sourceType = block.source?.type || 'unknown';
+                            textParts.push(`[Image ${mediaType} ${sourceType}]`);
+                        } else if (block.type === 'document') {
+                            const sourceType = block.source?.type || 'unknown';
+                            textParts.push(`[Document ${sourceType}]`);
                         }
                     }
                 }
@@ -419,41 +550,304 @@ export class OrchidsApiService {
             }
         }
         
-        return chatHistory;
+        return { chatHistory, toolResults: allToolResults };
     }
 
-    async _convertToOrchidsRequest(model, claudeRequest) {
-        const messages = claudeRequest.messages || [];
-        
-        const systemPrompt = this._extractSystemPrompt(messages);
-        const userMessage = this._extractUserMessage(messages);
-        
-        let lastUserMsgIndex = -1;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (msg.role === 'user') {
-                const content = msg.content;
-                if (Array.isArray(content)) {
-                    const hasToolResult = content.some(block => block.type === 'tool_result');
-                    const hasText = content.some(
-                        block => block.type === 'text' && !(block.text || '').includes('<system-reminder>')
-                    );
-                    if (hasText && !hasToolResult) {
-                        lastUserMsgIndex = i;
-                        break;
-                    }
+    /**
+     * 解析文本中的工具调用（支持多种格式）
+     * @param {string} text - 要解析的文本
+     * @param {Array} clientToolIndex - 客户端工具索引
+     * @returns {Array|null} 解析出的工具调用数组或 null
+     */
+    _parseTextToolCalls(text, clientToolIndex = []) {
+        if (!text || typeof text !== 'string') return null;
+
+        // 多种工具调用模式匹配
+        const patterns = [
+            // 标准格式：[Used tool: toolName with input: {...}]
+            /\[Used tool:\s*([^\s]+)\s+with input:\s*(\{[^}]*\}|\{[\s\S]*?\})\]/g,
+            // 简化格式：[toolName: {...}]
+            /\[([a-zA-Z_][a-zA-Z0-9_-]*?):\s*(\{[^}]*\}|\{[\s\S]*?\})\]/g,
+            // 函数调用格式：toolName({...})
+            /([a-zA-Z_][a-zA-Z0-9_-]*?)\s*\(\s*(\{[^}]*\}|\{[\s\S]*?\})\s*\)/g
+        ];
+
+        const toolCalls = [];
+        const seenCalls = new Set(); // 防重复
+
+        for (const pattern of patterns) {
+            let match;
+            while ((match = pattern.exec(text)) !== null) {
+                const [, orToolName, inputStr] = match;
+
+                // 防重复：基于完整匹配内容去重
+                const callKey = `${orToolName}:${inputStr}`;
+                if (seenCalls.has(callKey)) continue;
+                seenCalls.add(callKey);
+
+                try {
+                    const toolInput = JSON.parse(inputStr);
+                    const clientToolName = this._mapToolNameToClient(orToolName, toolInput, clientToolIndex);
+
+                    const toolCallId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+
+                    toolCalls.push({
+                        id: toolCallId,
+                        type: 'function',
+                        function: {
+                            name: clientToolName,
+                            arguments: JSON.stringify(toolInput)
+                        }
+                    });
+
+                    console.log(`[Orchids] Mapped tool from text: ${orToolName} -> ${clientToolName}`);
+
+                } catch (error) {
+                    console.warn(`[Orchids] Failed to parse tool input for ${orToolName}:`, error.message);
+                    continue;
                 }
             }
         }
+
+        return toolCalls.length > 0 ? toolCalls : null;
+    }
+
+    _extractAttachmentUrls(messages) {
+        const urls = [];
+        for (const msg of messages || []) {
+            const content = msg?.content;
+            if (!Array.isArray(content)) continue;
+            for (const block of content) {
+                if (!block) continue;
+                if (block.type !== 'image' && block.type !== 'document') continue;
+                const url = block.source?.url || block.url;
+                if (typeof url === 'string' && url.trim()) {
+                    urls.push(url.trim());
+                }
+            }
+        }
+        return [...new Set(urls)];
+    }
+
+    _normalizeToolName(name) {
+        const raw = String(name || '').trim();
+        if (!raw) return { raw: '', lowered: '', short: '' };
+        const lowered = raw.toLowerCase();
+        const parts = raw.split(/[./:]+/).filter(Boolean);
+        const short = (parts[parts.length - 1] || raw).toLowerCase();
+        return { raw, lowered, short };
+    }
+
+    _buildClientToolIndex(tools) {
+        if (!Array.isArray(tools)) return [];
+        return tools
+            .filter((t) => t && typeof t.name === 'string' && t.name.trim())
+            .map((t) => {
+                const normalized = this._normalizeToolName(t.name);
+                const props = t.input_schema?.properties && typeof t.input_schema.properties === 'object'
+                    ? new Set(Object.keys(t.input_schema.properties))
+                    : new Set();
+                return {
+                    name: t.name,
+                    normalized,
+                    props,
+                };
+            });
+    }
+
+    _mapToolNameToClient(orToolName, toolInput, clientToolIndex) {
+        const index = Array.isArray(clientToolIndex) ? clientToolIndex : [];
+        const normalized = this._normalizeToolName(orToolName);
+        if (!normalized.raw || index.length === 0) return normalized.raw || orToolName;
+
+        const exact = index.find((t) => t.name === normalized.raw);
+        if (exact) return exact.name;
+
+        const ci = index.find((t) => t.normalized.lowered === normalized.lowered);
+        if (ci) return ci.name;
+
+        const byShort = index.find((t) => t.normalized.short === normalized.short);
+        if (byShort) return byShort.name;
+
+        // 扩展的工具别名映射
+        const aliasCandidates = {
+            ripgrep: ['grep', 'ripgrep', 'search_files'],
+            glob: ['glob', 'list_files'],
+            read: ['read', 'readfile', 'read_file', 'view'],
+            write: ['write', 'writefile', 'write_file', 'create_file', 'createfile', 'save-file'],
+            edit: ['edit', 'editfile', 'edit_file', 'str-replace-editor', 'apply_diff'],
+            run_command: ['runcommand', 'run_command', 'bash', 'execute_command', 'launch-process'],
+            delete: ['delete', 'delete_file', 'remove-files'],
+            // 新增 Orchids 特有的工具映射
+            ask_followup_question: ['ask_followup_question', 'ask'],
+            attempt_completion: ['attempt_completion', 'complete'],
+            switch_mode: ['switch_mode', 'mode_switch'],
+            update_todo_list: ['update_todo_list', 'todo'],
+            new_task: ['new_task', 'task'],
+            fetch_instructions: ['fetch_instructions', 'instructions'],
+            // MCP 工具映射
+            'mcp--playwright--browser_navigate': ['browser_navigate', 'navigate'],
+            'mcp--playwright--browser_click': ['browser_click', 'click'],
+            'mcp--playwright--browser_type': ['browser_type', 'type'],
+            'mcp--playwright--browser_snapshot': ['browser_snapshot', 'snapshot'],
+            'mcp--playwright--browser_take_screenshot': ['browser_take_screenshot', 'screenshot'],
+        };
+
+        // 首先尝试直接别名匹配
+        const aliasKeys = aliasCandidates[normalized.short];
+        if (aliasKeys) {
+            const hit = index.find((t) => aliasKeys.includes(t.normalized.short));
+            if (hit) return hit.name;
+        }
+
+        // 反向查找：如果 Orchids 工具名在客户端工具的别名中
+        for (const clientTool of index) {
+            const clientAliases = aliasCandidates[clientTool.normalized.short] || [];
+            if (clientAliases.includes(normalized.short) || clientAliases.includes(normalized.lowered)) {
+                return clientTool.name;
+            }
+        }
+
+        // 基于输入参数的智能匹配
+        if (toolInput && typeof toolInput === 'object' && !Array.isArray(toolInput)) {
+            const inputKeys = Object.keys(toolInput);
+            if (inputKeys.length > 0) {
+                const candidates = index
+                    .map((t) => {
+                        if (!t.props || t.props.size === 0) return null;
+                        const hasAll = inputKeys.every((k) => t.props.has(k));
+                        if (!hasAll) return null;
+                        const score = inputKeys.reduce((acc, k) => acc + (t.props.has(k) ? 1 : 0), 0);
+                        return { name: t.name, score, extra: t.props.size - score };
+                    })
+                    .filter(Boolean)
+                    .sort((a, b) => (b.score - a.score) || (a.extra - b.extra));
+                if (candidates.length > 0) return candidates[0].name;
+            }
+        }
+
+        return normalized.raw;
+    }
+
+    async _convertToOrchidsRequest(model, claudeRequest, thinking = null, tools = null) {
+        const messages = claudeRequest.messages || [];
         
-        const chatHistory = lastUserMsgIndex >= 0
-            ? this._convertMessagesToChatHistory(messages.slice(0, lastUserMsgIndex))
+        const systemPrompt = this._extractSystemPrompt(messages);
+        // _extractUserMessage 现在返回 { text, toolResults } 对象
+        const userMessageResult = this._extractUserMessage(messages);
+        const userMessage = userMessageResult.text;
+        const currentToolResults = userMessageResult.toolResults;
+        
+        // ========================================================================
+        // 工具定义转换（参考 Kiro 实现）
+        // ========================================================================
+        let orchidsTools = null;
+        if (tools && Array.isArray(tools) && tools.length > 0) {
+            // 过滤掉 web_search 或 websearch 工具（忽略大小写）
+            const filteredTools = tools.filter(tool => {
+                const name = (tool.name || '').toLowerCase();
+                const shouldIgnore = name === 'web_search' || name === 'websearch';
+                if (shouldIgnore) {
+                    console.log(`[Orchids] Ignoring tool: ${tool.name}`);
+                }
+                return !shouldIgnore;
+            });
+            
+            if (filteredTools.length === 0) {
+                // 所有工具都被过滤掉了，不添加 tools 上下文
+                console.log('[Orchids] All tools were filtered out');
+            } else {
+                const MAX_DESCRIPTION_LENGTH = 9216;
+                
+                let truncatedCount = 0;
+                orchidsTools = filteredTools.map(tool => {
+                    let desc = tool.description || '';
+                    const originalLength = desc.length;
+                    
+                    if (desc.length > MAX_DESCRIPTION_LENGTH) {
+                        desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + '...';
+                        truncatedCount++;
+                        console.log(`[Orchids] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
+                    }
+                    
+                    return {
+                        toolSpecification: {
+                            name: tool.name,
+                            description: desc,
+                            inputSchema: {
+                                json: tool.input_schema || {}
+                            }
+                        }
+                    };
+                });
+                
+                if (truncatedCount > 0) {
+                    console.log(`[Orchids] Truncated ${truncatedCount} tool description(s) to max ${MAX_DESCRIPTION_LENGTH} chars`);
+                }
+                
+                console.log(`[Orchids] Converted ${orchidsTools.length} tools for request`);
+            }
+        }
+        
+        // 生成 thinking 前缀
+        const thinkingPrefix = this._generateThinkingPrefix(thinking);
+        
+        const isUserInputMessage = (msg) => {
+            if (!msg || msg.role !== 'user') return false;
+            const content = msg.content;
+            if (typeof content === 'string') return content.trim().length > 0;
+            if (!Array.isArray(content)) return false;
+            return content.some(block => {
+                if (!block) return false;
+                if (block.type === 'tool_result') return true;
+                if (block.type === 'text') {
+                    const text = block.text || '';
+                    return !text.includes('<system-reminder>') && text.trim().length > 0;
+                }
+                if (block.type === 'image' || block.type === 'document') return true;
+                return false;
+            });
+        };
+        
+        let currentUserMsgIndex = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (isUserInputMessage(messages[i])) {
+                currentUserMsgIndex = i;
+                break;
+            }
+        }
+        
+        // _convertMessagesToChatHistory 现在返回 { chatHistory, toolResults } 对象
+        const historyResult = currentUserMsgIndex >= 0
+            ? this._convertMessagesToChatHistory(messages.slice(0, currentUserMsgIndex))
             : this._convertMessagesToChatHistory(messages);
+        
+        const chatHistory = historyResult.chatHistory;
+        const historyToolResults = historyResult.toolResults;
+        
+        // 合并所有 toolResults（历史 + 当前消息）
+        const allToolResults = [...historyToolResults, ...currentToolResults];
+        
+        // 去重 toolResults - 参考 Kiro 实现，API 不接受重复的 toolUseId
+        const uniqueToolResults = [];
+        const seenIds = new Set();
+        for (const tr of allToolResults) {
+            if (!seenIds.has(tr.toolUseId)) {
+                seenIds.add(tr.toolUseId);
+                uniqueToolResults.push(tr);
+            }
+        }
+        
+        if (uniqueToolResults.length > 0) {
+            console.log(`[Orchids] Collected ${uniqueToolResults.length} tool result(s) for request`);
+        }
         
         const now = new Date();
         const dateStr = now.toISOString().split('T')[0];
         
-        const prompt = `<context>
+        // 构建 prompt，如果有 thinking 前缀则注入到开头
+        const promptContent = `
+<context>
 You are Claude, an AI assistant by Anthropic, helping users through a general-purpose API interface. This interface supports various programming languages and tasks beyond any specific framework.
 </context>
 
@@ -482,18 +876,32 @@ ${userMessage}
 </user_message>
 `;
         
+        // 如果有 thinking 前缀且 prompt 中尚未包含，则注入到开头
+        const prompt = (thinkingPrefix && !this._hasThinkingPrefix(promptContent))
+            ? thinkingPrefix + '\n' + promptContent
+            : promptContent;
+        
         return {
             type: 'user_request',
             data: {
                 projectId: null,
+                chatSessionId: `chat_${uuidv4().replace(/-/g, '').slice(0, 12)}`,
                 prompt: prompt,
                 agentMode: model || ORCHIDS_CONSTANTS.DEFAULT_MODEL,
                 mode: 'agent',
                 chatHistory: chatHistory,
+                attachmentUrls: this._extractAttachmentUrls(messages),
+                currentPage: null,
                 email: 'bridge@localhost',
-                isLocal: false,
+                isLocal: Boolean(this.config?.ORCHIDS_LOCAL_WORKDIR),
                 isFixingErrors: false,
+                localWorkingDirectory: this.config?.ORCHIDS_LOCAL_WORKDIR || undefined,
+                fileStructure: undefined,
                 userId: this.userId || 'local_user',
+                // 工具定义（如果有）
+                ...(orchidsTools && orchidsTools.length > 0 ? { tools: orchidsTools } : {}),
+                // 工具结果（如果有）- 参考 Kiro 实现
+                ...(uniqueToolResults.length > 0 ? { toolResults: uniqueToolResults } : {}),
             },
         };
     }
@@ -502,42 +910,506 @@ ${userMessage}
      * 发送 fs_operation_response 到 WebSocket
      * 参考 simple_api.py 的实现：收到 fs_operation 后需要返回响应，否则 Orchids 会一直等待
      */
-    _createFsOperationResponse(opId, success = true, data = null) {
+    _createFsOperationResponse(opId, success = true, data = null, error = undefined) {
         return {
             type: 'fs_operation_response',
             id: opId,
             success: success,
             data: data,
+            error: error,
         };
+    }
+
+    _getAgentWsBaseUrl() {
+        const configured = this.config?.ORCHIDS_WS_BASE_URL;
+        if (configured && typeof configured === 'string') {
+            return configured.replace(/\/$/, '');
+        }
+        const apiBase = (this.config?.ORCHIDS_API_BASE_URL || ORCHIDS_CONSTANTS.API_BASE_URL).replace(/\/$/, '');
+        const wsBase = apiBase.replace(/^http/, 'ws');
+        return `${wsBase}/agent/ws`;
+    }
+
+    _buildAgentWsUrl(endpoint = ORCHIDS_CONSTANTS.DEFAULT_ENDPOINT) {
+        const base = this._getAgentWsBaseUrl();
+        const version = this.config?.ORCHIDS_API_VERSION || ORCHIDS_CONSTANTS.ORCHIDS_API_VERSION;
+        const token = this.clerkToken || '';
+        return `${base}/${endpoint}?token=${encodeURIComponent(token)}&orchids_api_version=${encodeURIComponent(version)}`;
+    }
+
+    _resolveFsPath(inputPath, workingDirectory) {
+        if (!inputPath) return inputPath;
+        if (typeof inputPath !== 'string') return inputPath;
+        if (/^[a-zA-Z]:[\\/]/.test(inputPath) || inputPath.startsWith('\\\\')) return inputPath;
+        if (inputPath.startsWith('/')) return inputPath;
+        if (!workingDirectory) return inputPath;
+        return path.join(workingDirectory, inputPath);
+    }
+
+    async _handleFsOperation(ws, message, workingDirectory) {
+        const opId = message.id;
+        const operation = message.operation || '';
+        const filePath = this._resolveFsPath(message.path, workingDirectory);
+        const content = message.content;
+        const command = message.command;
+
+        const send = (payload) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(payload));
+            }
+        };
+
+        try {
+            switch (operation) {
+                case 'read': {
+                    if (!filePath) {
+                        send(this._createFsOperationResponse(opId, false, null, 'Path is required for read operation'));
+                        return;
+                    }
+                    const text = await fs.readFile(filePath, 'utf8');
+                    send(this._createFsOperationResponse(opId, true, text));
+                    return;
+                }
+                case 'write': {
+                    if (!filePath) {
+                        send(this._createFsOperationResponse(opId, false, null, 'Path is required for write operation'));
+                        return;
+                    }
+                    if (content === undefined) {
+                        send(this._createFsOperationResponse(opId, false, null, 'Content is required for write operation'));
+                        return;
+                    }
+                    await fs.mkdir(path.dirname(filePath), { recursive: true });
+                    await fs.writeFile(filePath, String(content), 'utf8');
+                    send(this._createFsOperationResponse(opId, true, null));
+                    return;
+                }
+                case 'delete': {
+                    if (!filePath) {
+                        send(this._createFsOperationResponse(opId, false, null, 'Path is required for delete operation'));
+                        return;
+                    }
+                    await fs.rm(filePath, { recursive: true, force: true });
+                    send(this._createFsOperationResponse(opId, true, null));
+                    return;
+                }
+                case 'list': {
+                    const toList = filePath || workingDirectory || '.';
+                    const entries = await fs.readdir(toList);
+                    send(this._createFsOperationResponse(opId, true, entries));
+                    return;
+                }
+                case 'run_command': {
+                    if (!command) {
+                        send(this._createFsOperationResponse(opId, false, null, 'Command is required for run_command operation'));
+                        return;
+                    }
+                    const allow = this.config?.ORCHIDS_ALLOW_RUN_COMMAND === true;
+                    if (!allow) {
+                        send(this._createFsOperationResponse(opId, false, null, 'run_command is disabled by server config'));
+                        return;
+                    }
+                    const isBackground = message.is_background === true;
+                    const bashId = message.bash_id || `bash_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
+                    const cwd = workingDirectory || process.cwd();
+
+                    if (isBackground) {
+                        const proc = spawn(command, {
+                            cwd,
+                            shell: true,
+                            windowsHide: true,
+                        });
+
+                        const record = {
+                            bashId,
+                            proc,
+                            output: '',
+                            exited: false,
+                            exitCode: null,
+                        };
+                        this.backgroundProcesses.set(bashId, record);
+
+                        proc.stdout?.on('data', (buf) => {
+                            record.output += buf.toString();
+                        });
+                        proc.stderr?.on('data', (buf) => {
+                            record.output += buf.toString();
+                        });
+                        proc.on('close', (code) => {
+                            record.exited = true;
+                            record.exitCode = code;
+                        });
+
+                        send(this._createFsOperationResponse(opId, true, `Started background process: ${bashId}`));
+                        return;
+                    }
+
+                    const proc = spawn(command, {
+                        cwd,
+                        shell: true,
+                        windowsHide: true,
+                    });
+
+                    let output = '';
+                    proc.stdout?.on('data', (buf) => {
+                        output += buf.toString();
+                    });
+                    proc.stderr?.on('data', (buf) => {
+                        output += buf.toString();
+                    });
+
+                    const exitCode = await new Promise((resolve, reject) => {
+                        proc.on('error', reject);
+                        proc.on('close', resolve);
+                    });
+
+                    if (exitCode === 0) {
+                        send(this._createFsOperationResponse(opId, true, output));
+                    } else {
+                        send(this._createFsOperationResponse(opId, false, output, `Command failed with exit code ${exitCode}`));
+                    }
+                    return;
+                }
+                case 'get_background_output': {
+                    const bashId = message.bash_id;
+                    if (!bashId) {
+                        send(this._createFsOperationResponse(opId, false, null, 'bash_id is required for get_background_output operation'));
+                        return;
+                    }
+                    const record = this.backgroundProcesses.get(bashId);
+                    if (!record) {
+                        send(this._createFsOperationResponse(opId, false, null, `Unknown bash_id: ${bashId}`));
+                        return;
+                    }
+                    send(this._createFsOperationResponse(opId, true, record.output));
+                    return;
+                }
+                case 'kill_background_process': {
+                    const bashId = message.bash_id;
+                    if (!bashId) {
+                        send(this._createFsOperationResponse(opId, false, null, 'bash_id is required for kill_background_process operation'));
+                        return;
+                    }
+                    const record = this.backgroundProcesses.get(bashId);
+                    if (!record) {
+                        send(this._createFsOperationResponse(opId, false, null, `Unknown bash_id: ${bashId}`));
+                        return;
+                    }
+                    try {
+                        record.proc.kill();
+                        this.backgroundProcesses.delete(bashId);
+                        send(this._createFsOperationResponse(opId, true, `Killed background process: ${bashId}`));
+                    } catch (e) {
+                        send(this._createFsOperationResponse(opId, false, null, e?.message || 'Failed to kill background process'));
+                    }
+                    return;
+                }
+                case 'glob': {
+                    const params = message.globParameters || {};
+                    const pattern = params.pattern || params.glob || '';
+                    const root = this._resolveFsPath(params.path || workingDirectory || '.', workingDirectory) || '.';
+                    const maxResults = Number.isFinite(params.maxResults) ? params.maxResults : 500;
+                    const matches = await this._globSearch(root, pattern, maxResults);
+                    send(this._createFsOperationResponse(opId, true, matches));
+                    return;
+                }
+                case 'ripgrep': {
+                    const params = message.ripgrepParameters || {};
+                    const output = await this._ripgrepSearch(params, workingDirectory);
+                    send(this._createFsOperationResponse(opId, true, output));
+                    return;
+                }
+                case 'get_terminal_logs': {
+                    send(this._createFsOperationResponse(opId, true, ''));
+                    return;
+                }
+                case 'get_browser_logs': {
+                    send(this._createFsOperationResponse(opId, true, ''));
+                    return;
+                }
+                case 'update_startup_commands': {
+                    send(this._createFsOperationResponse(opId, true, null));
+                    return;
+                }
+                case 'create_terminal':
+                case 'kill_terminal':
+                default: {
+                    send(this._createFsOperationResponse(opId, false, null, `Unknown operation: ${operation}`));
+                }
+            }
+        } catch (error) {
+            send(this._createFsOperationResponse(opId, false, null, error?.message || 'Unknown error'));
+        }
+    }
+
+    _globToRegExp(globPattern) {
+        const pattern = String(globPattern || '').replace(/\\/g, '/');
+        let re = '^';
+        for (let i = 0; i < pattern.length; i++) {
+            const ch = pattern[i];
+            if (ch === '*') {
+                const next = pattern[i + 1];
+                if (next === '*') {
+                    const nextNext = pattern[i + 2];
+                    if (nextNext === '/') {
+                        re += '(?:.*/)?';
+                        i += 2;
+                    } else {
+                        re += '.*';
+                        i++;
+                    }
+                } else {
+                    re += '[^/]*';
+                }
+            } else if (ch === '?') {
+                re += '[^/]';
+            } else {
+                re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+            }
+        }
+        re += '$';
+        return new RegExp(re);
+    }
+
+    async _globSearch(rootPath, globPattern, maxResults) {
+        if (!globPattern) return [];
+        const matcher = this._globToRegExp(globPattern);
+        const root = path.resolve(rootPath);
+        const results = [];
+        const stack = [root];
+
+        while (stack.length > 0 && results.length < maxResults) {
+            const current = stack.pop();
+            let entries;
+            try {
+                entries = await fs.readdir(current, { withFileTypes: true });
+            } catch {
+                continue;
+            }
+            for (const entry of entries) {
+                if (results.length >= maxResults) break;
+                const fullPath = path.join(current, entry.name);
+                const relative = path.relative(root, fullPath).replace(/\\/g, '/');
+                if (entry.isDirectory()) {
+                    if (entry.name !== 'node_modules' && entry.name !== '.git') {
+                        stack.push(fullPath);
+                    }
+                } else if (entry.isFile()) {
+                    if (matcher.test(relative)) {
+                        results.push(fullPath);
+                    }
+                }
+            }
+        }
+
+        return results;
+    }
+
+    async _collectFilesFromPaths(pathsInput, workingDirectory, maxFiles) {
+        const startPaths = Array.isArray(pathsInput) && pathsInput.length > 0 ? pathsInput : [workingDirectory || '.'];
+        const results = [];
+        const visited = new Set();
+        const stack = startPaths
+            .filter(Boolean)
+            .map(p => path.resolve(this._resolveFsPath(p, workingDirectory) || p));
+
+        while (stack.length > 0 && results.length < maxFiles) {
+            const current = stack.pop();
+            if (!current || visited.has(current)) continue;
+            visited.add(current);
+
+            let stat;
+            try {
+                stat = await fs.stat(current);
+            } catch {
+                continue;
+            }
+
+            if (stat.isDirectory()) {
+                let entries;
+                try {
+                    entries = await fs.readdir(current, { withFileTypes: true });
+                } catch {
+                    continue;
+                }
+                for (const entry of entries) {
+                    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+                    stack.push(path.join(current, entry.name));
+                }
+            } else if (stat.isFile()) {
+                results.push(current);
+            }
+        }
+
+        return results;
+    }
+
+    async _ripgrepSearch(params, workingDirectory) {
+        const query = String(params.query || '');
+        if (!query) return '';
+
+        const maxResults = Number.isFinite(params.maxResults) ? params.maxResults : 200;
+        const maxFiles = Number.isFinite(params.maxFiles) ? params.maxFiles : 5000;
+        const caseInsensitive = params.caseInsensitive === true;
+        const isRegex = params.isRegex === true;
+
+        let regexp = null;
+        if (isRegex) {
+            try {
+                regexp = new RegExp(query, caseInsensitive ? 'i' : undefined);
+            } catch {
+                regexp = null;
+            }
+        }
+
+        const files = await this._collectFilesFromPaths(params.paths, workingDirectory, maxFiles);
+        let found = 0;
+        const linesOut = [];
+
+        for (const filePath of files) {
+            if (found >= maxResults) break;
+            let stat;
+            try {
+                stat = await fs.stat(filePath);
+            } catch {
+                continue;
+            }
+            if (stat.size > 2 * 1024 * 1024) continue;
+
+            let text;
+            try {
+                text = await fs.readFile(filePath, 'utf8');
+            } catch {
+                continue;
+            }
+
+            const lines = text.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+                if (found >= maxResults) break;
+                const line = lines[i];
+                let idx = -1;
+                if (regexp) {
+                    const m = regexp.exec(line);
+                    if (m) idx = m.index;
+                } else {
+                    const hay = caseInsensitive ? line.toLowerCase() : line;
+                    const needle = caseInsensitive ? query.toLowerCase() : query;
+                    idx = hay.indexOf(needle);
+                }
+                if (idx >= 0) {
+                    found++;
+                    linesOut.push(`${filePath}:${i + 1}:${idx + 1}:${line}`);
+                }
+            }
+        }
+
+        return linesOut.join('\n');
     }
 
     _convertToAnthropicSSE(orchidsMessage, state) {
         const msgType = orchidsMessage.type;
         const events = [];
-        
+        // 默认启用工具调用输出，与 Kiro 行为一致
+        const emitToolUse = this.config?.ORCHIDS_EMIT_TOOL_USE !== false;
+
         // ========================================================================
         // 注意：Orchids API 会同时发送两种事件流：
         // 1. model 事件 - 底层模型事件（reasoning-delta, text-delta 等）
-        // 2. coding_agent.* 事件 - 高层代理事件（reasoning.chunk, response.chunk 等）
+        // 2. coding_agent.* 事件 - 高层代理事件（reasoning.chunk, output_text_delta 等）
         //
         // 这两种事件包含相同的内容，为避免重复处理导致叠字，
-        // 我们只处理 model 事件，忽略 coding_agent.reasoning 和 coding_agent.response 事件
+        // 我们优先处理 coding_agent 事件，完全忽略对应的 model 事件
         // ========================================================================
-        
-        // 忽略 coding_agent.reasoning 事件（使用 model.reasoning-* 代替）
-        if (msgType === 'coding_agent.reasoning.started' ||
-            msgType === 'coding_agent.reasoning.chunk' ||
-            msgType === 'coding_agent.reasoning.completed') {
+
+        // 处理 coding_agent 推理事件
+        if (msgType === 'coding_agent.reasoning.chunk') {
+            state.preferCodingAgentEvents = true; // 标记优先使用 coding_agent 事件
+            const chunk = orchidsMessage.data || orchidsMessage.chunk;
+            const text = typeof chunk === 'string' ? chunk : (chunk?.text || chunk?.content || '');
+            if (text && !state.reasoningStarted) {
+                state.reasoningStarted = true;
+                state.currentBlockIndex = 0;
+                events.push({
+                    type: 'content_block_start',
+                    index: 0,
+                    content_block: {
+                        type: 'thinking',
+                        thinking: '',
+                    },
+                });
+            }
+            if (text && state.reasoningStarted) {
+                return {
+                    type: 'content_block_delta',
+                    index: 0,
+                    delta: {
+                        type: 'thinking_delta',
+                        thinking: text,
+                    },
+                };
+            }
             return null;
+        }
+
+        if (msgType === 'coding_agent.reasoning.completed') {
+            state.preferCodingAgentEvents = true;
+            if (state.reasoningStarted && !state.reasoningEnded) {
+                state.reasoningEnded = true;
+                events.push({
+                    type: 'content_block_stop',
+                    index: 0,
+                });
+            }
+            return events.length > 0 ? events : null;
+        }
+
+        // 处理 coding_agent 输出文本事件
+        if (msgType === 'output_text_delta') {
+            state.preferCodingAgentEvents = true; // 标记优先使用 coding_agent 事件
+            const text = orchidsMessage.delta || orchidsMessage.text || '';
+            if (text) {
+                // 累积文本用于后续解析工具调用
+                state.accumulatedText += text;
+
+                if (!state.responseStarted) {
+                    state.responseStarted = true;
+                    state.currentBlockIndex = state.reasoningStarted ? 1 : 0;
+                    state.textBlockClosed = false;
+                    events.push({
+                        type: 'content_block_start',
+                        index: state.currentBlockIndex,
+                        content_block: {
+                            type: 'text',
+                            text: '',
+                        },
+                    });
+                }
+
+                // 发送文本增量事件
+                events.push({
+                    type: 'content_block_delta',
+                    index: state.currentBlockIndex,
+                    delta: {
+                        type: 'text_delta',
+                        text: text,
+                    },
+                });
+            }
+            return events.length > 0 ? events : null;
         }
         
         // ========================================================================
-        // 处理 model 事件（底层模型事件）- 主要事件源
+        // 处理 model 事件（底层模型事件）- 只在没有 coding_agent 事件时处理
         // ========================================================================
         if (msgType === 'model') {
             const event = orchidsMessage.event || {};
             const eventType = event.type || '';
-            
+
+            // 如果已经有 coding_agent 事件，跳过 model 事件以避免重复
+            if (state.preferCodingAgentEvents) {
+                return null;
+            }
+
             // --------------------------------------------------------------------
             // 处理 reasoning 事件（模型级别的思考）
             // --------------------------------------------------------------------
@@ -556,7 +1428,7 @@ ${userMessage}
                 }
                 return events.length > 0 ? events : null;
             }
-            
+
             if (eventType === 'reasoning-delta') {
                 const text = event.delta || '';
                 if (text && state.reasoningStarted) {
@@ -571,7 +1443,7 @@ ${userMessage}
                 }
                 return null;
             }
-            
+
             if (eventType === 'reasoning-end') {
                 if (state.reasoningStarted && !state.reasoningEnded) {
                     state.reasoningEnded = true;
@@ -588,9 +1460,11 @@ ${userMessage}
             // 这是 Orchids 原生工具调用的核心事件
             // --------------------------------------------------------------------
             if (eventType === 'tool-input-start') {
+                if (!emitToolUse) return null;
                 const toolCallId = event.id || `toolu_${uuidv4().replace(/-/g, '').substring(0, 12)}`;
                 const toolName = event.toolName || 'unknown';
-                
+                const mappedToolName = this._mapToolNameToClient(toolName, null, state.clientToolIndex);
+
                 // 关闭之前的文本块（如果有）
                 if (state.responseStarted && !state.textBlockClosed) {
                     events.push({
@@ -599,7 +1473,16 @@ ${userMessage}
                     });
                     state.textBlockClosed = true;
                 }
-                
+
+                // 关闭 reasoning 块（如果还没关闭）
+                if (state.reasoningStarted && !state.reasoningEnded) {
+                    state.reasoningEnded = true;
+                    events.push({
+                        type: 'content_block_stop',
+                        index: 0,
+                    });
+                }
+
                 // 确定工具调用的索引
                 // 索引计算：reasoning块(0) + 文本块(如果有) + 之前的工具块
                 let toolIndex = 0;
@@ -613,40 +1496,43 @@ ${userMessage}
                 if (state.toolUseIndex > 1) {
                     toolIndex = state.toolUseIndex;
                 }
-                
+
                 state.currentToolIndex = toolIndex;
                 state.currentToolId = toolCallId;
-                state.currentToolName = toolName;
+                state.currentToolName = mappedToolName;
                 state.currentToolInput = '';
+                state.currentToolHadDelta = false;
                 state.toolUseIndex = toolIndex + 1;
-                
+
                 // 记录到 pendingTools
                 state.pendingTools[toolCallId] = {
                     id: toolCallId,
-                    name: toolName,
+                    name: mappedToolName,
                     input: {},
                 };
-                
-                console.log(`[Orchids] Tool call started: ${toolName} (${toolCallId})`);
-                
+
+                console.log(`[Orchids] Tool call started: ${mappedToolName} (${toolCallId}) at index ${toolIndex}`);
+
                 events.push({
                     type: 'content_block_start',
                     index: toolIndex,
                     content_block: {
                         type: 'tool_use',
                         id: toolCallId,
-                        name: toolName,
+                        name: mappedToolName,
                         input: {},
                     },
                 });
-                
+
                 return events.length > 0 ? events : null;
             }
             
             if (eventType === 'tool-input-delta') {
+                if (!emitToolUse) return null;
                 const delta = event.delta || '';
                 if (delta && state.currentToolId) {
                     state.currentToolInput += delta;
+                    state.currentToolHadDelta = true;
                     
                     events.push({
                         type: 'content_block_delta',
@@ -661,6 +1547,7 @@ ${userMessage}
             }
             
             if (eventType === 'tool-input-end') {
+                if (!emitToolUse) return null;
                 // 工具输入结束，解析完整的 JSON 参数
                 if (state.currentToolId && state.currentToolInput) {
                     try {
@@ -672,15 +1559,49 @@ ${userMessage}
                         console.warn(`[Orchids] Failed to parse tool input: ${e.message}`);
                     }
                 }
-                return null;
+                
+                if (state.currentToolId && state.currentToolIndex !== undefined) {
+                    if (!state.currentToolHadDelta && state.currentToolInput) {
+                        events.push({
+                            type: 'content_block_delta',
+                            index: state.currentToolIndex,
+                            delta: {
+                                type: 'input_json_delta',
+                                partial_json: state.currentToolInput,
+                            },
+                        });
+                    }
+                    
+                    events.push({
+                        type: 'content_block_stop',
+                        index: state.currentToolIndex,
+                    });
+                    
+                    state.currentToolId = null;
+                    state.currentToolName = null;
+                    state.currentToolInput = '';
+                    state.currentToolIndex = undefined;
+                    state.currentToolHadDelta = false;
+                }
+                
+                return events.length > 0 ? events : null;
             }
             
             if (eventType === 'tool-call') {
+                if (!emitToolUse) return null;
                 // 完整的工具调用信息，可以用来验证/补充
+                // 注意：tool-call 事件可能在 tool-input-end 之前到达，且 toolCallId 可能与 tool-input-start 的 id 不同
+                // 这种情况下，我们应该忽略这个事件，让 tool-input-end 来处理
                 const toolCallId = event.toolCallId || state.currentToolId;
-                const toolName = event.toolName || state.currentToolName;
                 const inputStr = event.input || '';
-                
+
+                // 如果当前有正在进行的工具调用，且 toolCallId 不匹配，忽略这个事件
+                if (state.currentToolId && toolCallId !== state.currentToolId) {
+                    console.log(`[Orchids] Ignoring tool-call with mismatched id: ${toolCallId} vs ${state.currentToolId}`);
+                    return null;
+                }
+
+                // 如果 toolCallId 匹配，更新 pendingTools 的 input
                 if (toolCallId && state.pendingTools[toolCallId]) {
                     try {
                         const parsedInput = JSON.parse(inputStr);
@@ -689,21 +1610,11 @@ ${userMessage}
                         // 忽略解析错误
                     }
                 }
-                
-                // 关闭工具调用块
-                if (state.currentToolIndex !== undefined) {
-                    events.push({
-                        type: 'content_block_stop',
-                        index: state.currentToolIndex,
-                    });
-                    
-                    // 重置当前工具状态
-                    state.currentToolId = null;
-                    state.currentToolName = null;
-                    state.currentToolInput = '';
-                    state.currentToolIndex = undefined;
-                }
-                
+
+                // 只有在没有正在进行的工具调用时才关闭工具调用块
+                // 因为 tool-input-end 会处理关闭
+                // 这里不再重置状态，让 tool-input-end 来处理
+
                 return events.length > 0 ? events : null;
             }
             
@@ -726,13 +1637,13 @@ ${userMessage}
                 }
                 return events.length > 0 ? events : null;
             }
-            
+
             if (eventType === 'text-delta') {
                 const text = event.delta || '';
                 if (text) {
-                    // 累积文本用于后续解析 XML 工具调用
+                    // 累积文本用于后续解析工具调用
                     state.accumulatedText += text;
-                    
+
                     if (!state.responseStarted) {
                         state.responseStarted = true;
                         state.currentBlockIndex = state.reasoningStarted ? 1 : 0;
@@ -746,6 +1657,8 @@ ${userMessage}
                             },
                         });
                     }
+
+                    // 发送文本增量事件
                     events.push({
                         type: 'content_block_delta',
                         index: state.currentBlockIndex,
@@ -809,6 +1722,7 @@ ${userMessage}
         // 处理 coding_agent.Edit 事件（文件编辑工具调用）
         // ========================================================================
         if (msgType === 'coding_agent.Edit.edit.started') {
+            if (!emitToolUse) return null;
             const filePath = orchidsMessage.data?.file_path || '';
             const toolCallId = `toolu_edit_${uuidv4().replace(/-/g, '').substring(0, 8)}`;
             
@@ -878,6 +1792,7 @@ ${userMessage}
         }
         
         if (msgType === 'coding_agent.edit_file.started') {
+            if (!emitToolUse) return null;
             // 文件编辑开始，可能是新的编辑或继续之前的编辑
             const filePath = orchidsMessage.data?.file_path || '';
             if (!state.currentEditToolId) {
@@ -936,6 +1851,7 @@ ${userMessage}
         }
         
         if (msgType === 'coding_agent.edit_file.completed') {
+            if (!emitToolUse) return null;
             const data = orchidsMessage.data || {};
             const filePath = data.file_path || state.currentEditFilePath || '';
             const oldCode = data.old_code || '';
@@ -988,6 +1904,7 @@ ${userMessage}
         // 处理 coding_agent.todo_write 事件（待办列表工具调用）
         // ========================================================================
         if (msgType === 'coding_agent.todo_write.started') {
+            if (!emitToolUse) return null;
             const todos = orchidsMessage.data?.todos || [];
             const toolCallId = `toolu_todo_${uuidv4().replace(/-/g, '').substring(0, 8)}`;
             
@@ -1052,20 +1969,72 @@ ${userMessage}
             return null;
         }
         
-        // ========================================================================
-        // 忽略 coding_agent.response.chunk 事件（使用 model.text-delta 代替）
-        // 这两种事件包含相同的内容，为避免重复处理导致叠字
-        // ========================================================================
         if (msgType === 'coding_agent.response.chunk') {
-            return null;
+            state.preferCodingAgentEvents = true;
+            const chunk = orchidsMessage.chunk;
+            const text = typeof chunk === 'string' ? chunk : (chunk?.content || chunk?.text || '');
+            if (!text) return null;
+            
+            if (!state.responseStarted) {
+                state.responseStarted = true;
+                state.currentBlockIndex = state.reasoningStarted ? 1 : 0;
+                state.textBlockClosed = false;
+                events.push({
+                    type: 'content_block_start',
+                    index: state.currentBlockIndex,
+                    content_block: {
+                        type: 'text',
+                        text: '',
+                    },
+                });
+            }
+            
+            if (text === state.lastTextDelta) return events.length > 0 ? events : null;
+            state.lastTextDelta = text;
+            
+            events.push({
+                type: 'content_block_delta',
+                index: state.currentBlockIndex,
+                delta: {
+                    type: 'text_delta',
+                    text: text,
+                },
+            });
+            
+            return events.length > 0 ? events : null;
         }
         
-        // ========================================================================
-        // 忽略 output_text_delta 事件（使用 model.text-delta 代替）
-        // 这两种事件包含相同的内容，为避免重复处理导致叠字
-        // ========================================================================
         if (msgType === 'output_text_delta') {
-            return null;
+            state.preferCodingAgentEvents = true;
+            const text = orchidsMessage.textDelta || orchidsMessage.delta || orchidsMessage.text || '';
+            if (!text) return null;
+            
+            if (!state.responseStarted) {
+                state.responseStarted = true;
+                state.currentBlockIndex = state.reasoningStarted ? 1 : 0;
+                state.textBlockClosed = false;
+                events.push({
+                    type: 'content_block_start',
+                    index: state.currentBlockIndex,
+                    content_block: {
+                        type: 'text',
+                        text: '',
+                    },
+                });
+            }
+            
+            if (text === state.lastTextDelta) return events.length > 0 ? events : null;
+            state.lastTextDelta = text;
+            
+            events.push({
+                type: 'content_block_delta',
+                index: state.currentBlockIndex,
+                delta: {
+                    type: 'text_delta',
+                    text: text,
+                },
+            });
+            return events.length > 0 ? events : null;
         }
         
         // ========================================================================
@@ -1167,7 +2136,7 @@ ${userMessage}
                 index: blockIndex,
                 delta: {
                     type: 'input_json_delta',
-                    partial_json: '',
+                    partial_json: JSON.stringify(toolInput),
                 },
             },
         ];
@@ -1189,6 +2158,9 @@ ${userMessage}
         const finalModel = ORCHIDS_MODELS.includes(mappedModel) ? mappedModel : ORCHIDS_CONSTANTS.DEFAULT_MODEL;
         const requestId = uuidv4();
         const messageId = `msg_${requestId}`;
+        // 默认启用工具调用输出，与 Kiro 行为一致
+        const emitToolUse = this.config?.ORCHIDS_EMIT_TOOL_USE !== false;
+        const clientToolIndex = this._buildClientToolIndex(requestBody?.tools);
         
         // 状态跟踪
         const state = {
@@ -1202,11 +2174,14 @@ ${userMessage}
             inEditMode: false,
             responseDoneReceived: false,
             accumulatedText: '', // 累积文本用于解析 XML 工具调用
+            preferCodingAgentEvents: false,
+            lastTextDelta: '',
             // 当前工具调用状态（model.tool-input-* 事件）
             currentToolId: null,
             currentToolName: null,
             currentToolInput: '',
             currentToolIndex: undefined,
+            currentToolHadDelta: false,
             // 当前编辑工具状态（coding_agent.Edit.* 事件）
             currentEditToolId: null,
             currentEditToolIndex: undefined,
@@ -1220,6 +2195,7 @@ ${userMessage}
                 output_tokens: 0,
                 cache_read_input_tokens: 0,
             },
+            clientToolIndex,
         };
         
         // 消息队列和控制
@@ -1252,304 +2228,334 @@ ${userMessage}
             }
         };
         
-        try {
-            // 1. 发送 message_start 事件
-            yield {
-                type: 'message_start',
-                message: {
-                    id: messageId,
-                    type: 'message',
-                    role: 'assistant',
-                    model: model,
-                    usage: { input_tokens: 0, output_tokens: 0 },
-                    content: [],
-                },
+        const maxRetries = Number.isFinite(this.config?.ORCHIDS_WS_MAX_RETRIES) ? this.config.ORCHIDS_WS_MAX_RETRIES : 1;
+        let yieldedOutput = false;
+
+        // 日志持久化：记录完整的 WebSocket 消息流
+        const logEnabled = this.config?.ORCHIDS_LOG_ENABLED !== false;
+        const logDir = this.config?.ORCHIDS_LOG_DIR || 'configs/orchidslog';
+        const logTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const logFileName = `orchids_${logTimestamp}_${requestId.substring(0, 8)}.log`;
+        const logFilePath = path.join(logDir, logFileName);
+        const logEntries = [];
+
+        const appendLog = (direction, type, data) => {
+            if (!logEnabled) return;
+            const entry = {
+                timestamp: new Date().toISOString(),
+                direction, // 'SEND' | 'RECV' | 'INFO' | 'ERROR'
+                type,
+                data,
             };
+            logEntries.push(entry);
+        };
+
+        const flushLog = async () => {
+            if (!logEnabled || logEntries.length === 0) return;
+            try {
+                await fs.mkdir(logDir, { recursive: true });
+                const logContent = logEntries.map(e => JSON.stringify(e)).join('\n');
+                await fs.writeFile(logFilePath, logContent, 'utf8');
+                console.log(`[Orchids] Log saved to ${logFilePath}`);
+            } catch (e) {
+                console.warn(`[Orchids] Failed to save log: ${e.message}`);
+            }
+        };
+
+        appendLog('INFO', 'request_start', { model, finalModel, messageId, emitToolUse });
+
+        yield {
+            type: 'message_start',
+            message: {
+                id: messageId,
+                type: 'message',
+                role: 'assistant',
+                model: model,
+                usage: { input_tokens: 0, output_tokens: 0 },
+                content: [],
+            },
+        };
+        
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            let completedByProtocol = false;
+            let lastClose = null;
+            isComplete = false;
+            messageQueue.length = 0;
+            resolveMessage = null;
             
-            // 2. 确保 token 有效
-            await this.ensureValidToken();
-            
-            // 3. 创建新的 WebSocket 连接（每次请求新建）
-            const wsUrl = `${ORCHIDS_CONSTANTS.WS_URL}?token=${this.clerkToken}`;
-            
-            ws = new WebSocket(wsUrl, {
-                headers: {
-                    'User-Agent': ORCHIDS_CONSTANTS.USER_AGENT,
-                    'Origin': ORCHIDS_CONSTANTS.ORIGIN,
-                },
-            });
-            
-            // 4. 等待连接建立并设置消息处理
-            await new Promise((resolve, reject) => {
-                const connectionTimeout = setTimeout(() => {
-                    reject(new Error('[Orchids WS] Connection timeout'));
-                }, 30000);
+            try {
+                await this.ensureValidToken();
                 
-                ws.on('open', () => {
-                    // WebSocket opened
+                const wsEndpoint = this.config?.ORCHIDS_ENDPOINT || ORCHIDS_CONSTANTS.DEFAULT_ENDPOINT;
+                const wsUrl = this._buildAgentWsUrl(wsEndpoint);
+                
+                ws = new WebSocket(wsUrl, {
+                    headers: {
+                        'User-Agent': ORCHIDS_CONSTANTS.USER_AGENT,
+                        'Origin': ORCHIDS_CONSTANTS.ORIGIN,
+                    },
                 });
                 
-                ws.on('message', (data) => {
-                    try {
-                        const message = JSON.parse(data.toString());
-                        
-                        // 处理连接确认
-                        if (message.type === 'connected') {
-                            clearTimeout(connectionTimeout);
-                            resolve();
-                            return;
+                await new Promise((resolve, reject) => {
+                    let resolved = false;
+                    const connectionTimeout = setTimeout(() => {
+                        reject(new Error('[Orchids WS] Connection timeout'));
+                    }, 30000);
+                    
+                    ws.on('open', () => {
+                        if (resolved) return;
+                        resolved = true;
+                        clearTimeout(connectionTimeout);
+                        resolve();
+                    });
+                    
+                    ws.on('message', (data) => {
+                        try {
+                            const message = JSON.parse(data.toString());
+                            if (message.type === 'connected') {
+                                if (!resolved) {
+                                    resolved = true;
+                                    clearTimeout(connectionTimeout);
+                                    resolve();
+                                }
+                                return;
+                            }
+                            
+                            if (resolveMessage) {
+                                const resolver = resolveMessage;
+                                resolveMessage = null;
+                                resolver(message);
+                            } else {
+                                messageQueue.push(message);
+                            }
+                        } catch (e) {
+                            // ignore
                         }
-                        
-                        // 将消息加入队列
+                    });
+                    
+                    ws.on('error', (error) => {
+                        clearTimeout(connectionTimeout);
+                        reject(error);
+                    });
+                    
+                    ws.on('close', (code, reason) => {
+                        lastClose = { code, reason: reason?.toString?.() || '' };
+                        isComplete = true;
                         if (resolveMessage) {
-                            const resolver = resolveMessage;
-                            resolveMessage = null;
-                            resolver(message);
-                        } else {
-                            messageQueue.push(message);
+                            resolveMessage(null);
                         }
-                    } catch (e) {
-                        // 忽略非 JSON 消息
-                    }
+                    });
                 });
                 
-                ws.on('error', (error) => {
-                    clearTimeout(connectionTimeout);
-                    reject(error);
-                });
-                
-                ws.on('close', (code, reason) => {
-                    isComplete = true;
-                    if (resolveMessage) {
-                        resolveMessage(null);
+                const orchidsRequest = await this._convertToOrchidsRequest(finalModel, requestBody, requestBody.thinking, requestBody.tools);
+                appendLog('SEND', 'user_request', orchidsRequest);
+                ws.send(JSON.stringify(orchidsRequest));
+
+                while (!isComplete) {
+                    const message = await Promise.race([
+                        waitForMessage(),
+                        new Promise((resolve) => setTimeout(() => resolve('timeout'), 120000)),
+                    ]);
+
+                    if (message === 'timeout') {
+                        appendLog('ERROR', 'timeout', { reason: 'Message timeout after 120s' });
+                        throw new Error('[Orchids WS] Message timeout');
                     }
-                });
-            });
-            
-            // 5. 转换并发送请求
-            const orchidsRequest = await this._convertToOrchidsRequest(finalModel, requestBody);
-            ws.send(JSON.stringify(orchidsRequest));
-            
-            // 6. 处理消息循环
-            while (!isComplete) {
-                const message = await Promise.race([
-                    waitForMessage(),
-                    new Promise((resolve) => setTimeout(() => resolve('timeout'), 120000)),
-                ]);
-                
-                if (message === 'timeout') {
-                    break;
-                }
-                
-                if (!message) {
-                    break;
-                }
-                
-                const msgType = message.type;
-                
-                // 处理 coding_agent.tokens_used 事件
-                if (msgType === 'coding_agent.tokens_used') {
-                    const data = message.data || {};
-                    if (data.input_tokens !== undefined) {
-                        state.usage.input_tokens = data.input_tokens;
+
+                    if (!message) {
+                        appendLog('INFO', 'ws_closed', { reason: 'No more messages' });
+                        break;
                     }
-                    if (data.output_tokens !== undefined) {
-                        state.usage.output_tokens = data.output_tokens;
-                    }
-                    console.log(`[Orchids] Tokens used: input=${state.usage.input_tokens}, output=${state.usage.output_tokens}`);
-                    continue;
-                }
-                
-                // 检测 Edit 模式
-                if (msgType === 'coding_agent.Edit.started') {
-                    state.inEditMode = true;
-                }
-                if (msgType === 'coding_agent.edit_file.completed') {
-                    state.inEditMode = false;
-                }
-                
-                // 处理文件操作
-                // 参考 simple_api.py：收到 fs_operation 后需要返回 fs_operation_response，否则 Orchids 会一直等待
-                if (msgType === 'fs_operation') {
-                    const opId = message.id;
-                    const opType = message.operation || '';
+
+                    // 记录收到的每条消息
+                    appendLog('RECV', message.type || 'unknown', message);
+
+                    const msgType = message.type;
                     
-                    console.log(`[Orchids FS] Received: ${opType}: ${message.path || message.command || ''}`);
-                    
-                    // 发送 fs_operation_response 让 Orchids 继续
-                    // 对于所有操作类型，都返回空响应，让客户端处理实际的工具调用
-                    const fsResponse = this._createFsOperationResponse(opId, true, null);
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify(fsResponse));
-                        console.log(`[Orchids FS] Responded: ${opId}`);
-                    }
-                    
-                    // edit 操作不转发给客户端（Orchids 内部操作）
-                    if (opType === 'edit') {
+                    if (msgType === 'coding_agent.tokens_used') {
+                        const data = message.data || {};
+                        if (data.input_tokens !== undefined) {
+                            state.usage.input_tokens = data.input_tokens;
+                        }
+                        if (data.output_tokens !== undefined) {
+                            state.usage.output_tokens = data.output_tokens;
+                        }
+                        console.log(`[Orchids] Tokens used: input=${state.usage.input_tokens}, output=${state.usage.output_tokens}`);
                         continue;
                     }
                     
-                    // 将文件操作转换为 tool_use 事件转发给客户端
-                    state.pendingTools[opId] = message;
-                    
-                    if (!state.reasoningStarted && state.toolUseIndex === 1) {
-                        state.toolUseIndex = 0;
+                    if (msgType === 'coding_agent.Edit.started') {
+                        state.inEditMode = true;
                     }
-                    const currentIndex = state.toolUseIndex;
-                    state.toolUseIndex++;
-                    
-                    const toolUseEvents = this._convertFsOperationToToolUse(message, currentIndex);
-                    for (const event of toolUseEvents) {
-                        yield event;
+                    if (msgType === 'coding_agent.edit_file.completed') {
+                        state.inEditMode = false;
                     }
                     
-                    yield { type: 'content_block_stop', index: currentIndex };
+                    if (msgType === 'fs_operation') {
+                        const opId = message.id;
+                        const opType = message.operation || '';
+                        
+                        console.log(`[Orchids FS] Received: ${opType}: ${message.path || message.command || ''}`);
+                        await this._handleFsOperation(ws, message, this.config?.ORCHIDS_LOCAL_WORKDIR);
+                        console.log(`[Orchids FS] Responded: ${opId}`);
+                        continue;
+                    }
                     
-                    continue;
-                }
-                
-                // 转换并发送 SSE 事件
-                const sseEvent = this._convertToAnthropicSSE(message, state);
-                if (sseEvent) {
-                    if (Array.isArray(sseEvent)) {
-                        for (const event of sseEvent) {
-                            yield event;
+                    const sseEvent = this._convertToAnthropicSSE(message, state);
+                    if (sseEvent) {
+                        if (Array.isArray(sseEvent)) {
+                            for (const event of sseEvent) {
+                                yieldedOutput = true;
+                                yield event;
+                            }
+                        } else {
+                            yieldedOutput = true;
+                            yield sseEvent;
                         }
-                    } else {
-                        yield sseEvent;
                     }
-                }
-                
-                // 处理流结束事件：response_done, coding_agent.end, complete
-                // 参考 simple_api.py 的实现，收到这些事件后立即结束流
-                if (msgType === 'response_done' || msgType === 'coding_agent.end' || msgType === 'complete') {
-                    // 更新 usage 信息（仅 response_done 事件包含）
-                    if (msgType === 'response_done') {
-                        const responseUsage = message.response?.usage;
-                        if (responseUsage) {
-                            if (responseUsage.inputTokens !== undefined) {
-                                state.usage.input_tokens = responseUsage.inputTokens;
+                    
+                    if (msgType === 'response_done' || msgType === 'coding_agent.end' || msgType === 'complete') {
+                        completedByProtocol = true;
+                        if (msgType === 'response_done') {
+                            const responseUsage = message.response?.usage;
+                            if (responseUsage) {
+                                if (responseUsage.inputTokens !== undefined) {
+                                    state.usage.input_tokens = responseUsage.inputTokens;
+                                }
+                                if (responseUsage.outputTokens !== undefined) {
+                                    state.usage.output_tokens = responseUsage.outputTokens;
+                                }
+                                if (responseUsage.cachedInputTokens !== undefined) {
+                                    state.usage.cache_read_input_tokens = responseUsage.cachedInputTokens;
+                                }
+                                console.log(`[Orchids] Response usage: input=${state.usage.input_tokens}, output=${state.usage.output_tokens}, cached=${state.usage.cache_read_input_tokens}`);
                             }
-                            if (responseUsage.outputTokens !== undefined) {
-                                state.usage.output_tokens = responseUsage.outputTokens;
+                            
+                            const outputs = message.response?.output || [];
+                            for (const output of outputs) {
+                                // function_call 可能没有 status 字段，或者 status 为 'completed'
+                                if (output.type === 'function_call') {
+                                    const toolCallId = output.callId || `toolu_${uuidv4().replace(/-/g, '').substring(0, 12)}`;
+                                    const toolName = output.name || 'unknown';
+                                    let toolInput = {};
+                                    
+                                    try {
+                                        toolInput = JSON.parse(output.arguments || '{}');
+                                    } catch (e) {
+                                        console.warn(`[Orchids] Failed to parse function_call arguments: ${e.message}`);
+                                    }
+
+                                    const mappedToolName = this._mapToolNameToClient(toolName, toolInput, state.clientToolIndex);
+                                    
+                                    if (emitToolUse && !state.pendingTools[toolCallId]) {
+                                        if (state.responseStarted && !state.textBlockClosed) {
+                                            yieldedOutput = true;
+                                            yield {
+                                                type: 'content_block_stop',
+                                                index: state.currentBlockIndex,
+                                            };
+                                            state.textBlockClosed = true;
+                                        }
+                                        
+                                        let toolIndex = 0;
+                                        if (state.reasoningStarted) {
+                                            toolIndex = 1;
+                                        }
+                                        if (state.responseStarted) {
+                                            toolIndex = state.currentBlockIndex + 1;
+                                        }
+                                        if (state.toolUseIndex > 1) {
+                                            toolIndex = state.toolUseIndex;
+                                        }
+                                        state.toolUseIndex = toolIndex + 1;
+                                        
+                                        state.pendingTools[toolCallId] = {
+                                            id: toolCallId,
+                                            name: mappedToolName,
+                                            input: toolInput,
+                                        };
+                                        
+                                        yieldedOutput = true;
+                                        yield {
+                                            type: 'content_block_start',
+                                            index: toolIndex,
+                                            content_block: {
+                                                type: 'tool_use',
+                                                id: toolCallId,
+                                                name: mappedToolName,
+                                                input: toolInput,
+                                            },
+                                        };
+                                        
+                                        yield {
+                                            type: 'content_block_delta',
+                                            index: toolIndex,
+                                            delta: {
+                                                type: 'input_json_delta',
+                                                partial_json: JSON.stringify(toolInput),
+                                            },
+                                        };
+                                        
+                                        yield { type: 'content_block_stop', index: toolIndex };
+                                    }
+                                }
                             }
-                            if (responseUsage.cachedInputTokens !== undefined) {
-                                state.usage.cache_read_input_tokens = responseUsage.cachedInputTokens;
-                            }
-                            console.log(`[Orchids] Response usage: input=${state.usage.input_tokens}, output=${state.usage.output_tokens}, cached=${state.usage.cache_read_input_tokens}`);
                         }
                         
-                        // 处理 response_done 中的 function_call 输出（原生工具调用）
-                        const outputs = message.response?.output || [];
-                        for (const output of outputs) {
-                            if (output.type === 'function_call' && output.status === 'completed') {
-                                const toolCallId = output.callId || `toolu_${uuidv4().replace(/-/g, '').substring(0, 12)}`;
-                                const toolName = output.name || 'unknown';
-                                let toolInput = {};
-                                
-                                try {
-                                    toolInput = JSON.parse(output.arguments || '{}');
-                                } catch (e) {
-                                    console.warn(`[Orchids] Failed to parse function_call arguments: ${e.message}`);
-                                }
-                                
-                                // 如果这个工具调用还没有被处理过（通过 tool-input-* 事件）
-                                if (!state.pendingTools[toolCallId]) {
-                                    console.log(`[Orchids] Processing function_call from response_done: ${toolName} (${toolCallId})`);
-                                    
-                                    // 关闭之前的文本块（如果有且未关闭）
-                                    if (state.responseStarted && !state.textBlockClosed) {
-                                        yield {
-                                            type: 'content_block_stop',
-                                            index: state.currentBlockIndex,
-                                        };
-                                        state.textBlockClosed = true;
-                                    }
-                                    
-                                    // 确定工具调用的索引
-                                    let toolIndex = 0;
-                                    if (state.reasoningStarted) {
-                                        toolIndex = 1;
-                                    }
-                                    if (state.responseStarted) {
-                                        toolIndex = state.currentBlockIndex + 1;
-                                    }
-                                    if (state.toolUseIndex > 1) {
-                                        toolIndex = state.toolUseIndex;
-                                    }
-                                    state.toolUseIndex = toolIndex + 1;
-                                    
-                                    // 记录到 pendingTools
-                                    state.pendingTools[toolCallId] = {
-                                        id: toolCallId,
-                                        name: toolName,
-                                        input: toolInput,
-                                    };
-                                    
-                                    // 生成 tool_use 事件
-                                    yield {
-                                        type: 'content_block_start',
-                                        index: toolIndex,
-                                        content_block: {
-                                            type: 'tool_use',
-                                            id: toolCallId,
-                                            name: toolName,
-                                            input: toolInput,
-                                        },
-                                    };
-                                    
-                                    // 发送完整的 JSON 参数
-                                    yield {
-                                        type: 'content_block_delta',
-                                        index: toolIndex,
-                                        delta: {
-                                            type: 'input_json_delta',
-                                            partial_json: JSON.stringify(toolInput),
-                                        },
-                                    };
-                                    
-                                    // 关闭工具调用块
-                                    yield { type: 'content_block_stop', index: toolIndex };
-                                }
-                            }
+                        if (state.responseStarted && !state.textBlockClosed) {
+                            yieldedOutput = true;
+                            yield {
+                                type: 'content_block_stop',
+                                index: state.currentBlockIndex,
+                            };
+                            state.textBlockClosed = true;
                         }
-                    }
-                    
-                    // 关闭当前文本内容块（如果有且未关闭）
-                    if (state.responseStarted && !state.textBlockClosed) {
+                        
+                        const hasToolUse = Object.keys(state.pendingTools).length > 0;
+                        const stopReason = state.finishReason || ((emitToolUse && hasToolUse) ? 'tool_use' : 'end_turn');
+                        
                         yield {
-                            type: 'content_block_stop',
-                            index: state.currentBlockIndex,
+                            type: 'message_delta',
+                            delta: {
+                                stop_reason: stopReason,
+                                stop_sequence: null,
+                            },
+                            usage: { ...state.usage },
                         };
-                        state.textBlockClosed = true;
+                        
+                        yield { type: 'message_stop' };
+                        appendLog('INFO', 'request_complete', {
+                            stopReason,
+                            usage: state.usage,
+                            pendingToolsCount: Object.keys(state.pendingTools).length,
+                            yieldedOutput,
+                        });
+                        await flushLog();
+                        break;
                     }
-                    
-                    // 确定 stop_reason
-                    const hasToolUse = Object.keys(state.pendingTools).length > 0;
-                    // 优先使用 model.finish 事件中的 finishReason
-                    const stopReason = state.finishReason || (hasToolUse ? 'tool_use' : 'end_turn');
-                    
-                    // 发送 message_delta
-                    yield {
-                        type: 'message_delta',
-                        delta: {
-                            stop_reason: stopReason,
-                            stop_sequence: null,
-                        },
-                        usage: { ...state.usage },
-                    };
-                    
-                    // 发送 message_stop 并结束循环
-                    yield { type: 'message_stop' };
-                    break;
                 }
+
+                if (completedByProtocol) return;
+                const closeHint = lastClose ? `code=${lastClose.code} reason=${lastClose.reason}` : 'no-close-info';
+                appendLog('ERROR', 'incomplete', { closeHint });
+                await flushLog();
+                throw new Error(`[Orchids WS] Connection closed before completion (${closeHint})`);
+            } catch (error) {
+                appendLog('ERROR', 'exception', { message: error.message, stack: error.stack });
+                await flushLog();
+                closeWebSocket();
+                if (attempt < maxRetries && !yieldedOutput) {
+                    try {
+                        await this.initializeAuth(true);
+                    } catch {
+                        // ignore
+                    }
+                    continue;
+                }
+                throw error;
+            } finally {
+                closeWebSocket();
             }
-            
-        } catch (error) {
-            throw error;
-        } finally {
-            // 关闭 WebSocket 连接
-            closeWebSocket();
         }
     }
 
@@ -1557,40 +2563,81 @@ ${userMessage}
         if (!this.isInitialized) await this.initialize();
         
         const events = [];
-        let content = '';
-        const toolCalls = [];
+        const emitToolUse = this.config?.ORCHIDS_EMIT_TOOL_USE === true;
+        let thinking = '';
+        let text = '';
+        const toolCallsById = new Map();
+        const toolInputBuffersByIndex = new Map();
+        const toolIdByIndex = new Map();
+        const toolCallOrder = [];
         
         for await (const event of this.generateContentStream(model, requestBody)) {
             events.push(event);
             
+            if (emitToolUse && event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+                const id = event.content_block.id;
+                toolCallsById.set(id, {
+                    type: 'tool_use',
+                    id,
+                    name: event.content_block.name,
+                    input: {},
+                });
+                toolInputBuffersByIndex.set(event.index, '');
+                toolIdByIndex.set(event.index, id);
+                toolCallOrder.push(id);
+            }
+            
             if (event.type === 'content_block_delta') {
                 if (event.delta?.type === 'text_delta') {
-                    content += event.delta.text || '';
+                    text += event.delta.text || '';
+                }
+                if (event.delta?.type === 'thinking_delta') {
+                    thinking += event.delta.thinking || '';
+                }
+                if (emitToolUse && event.delta?.type === 'input_json_delta') {
+                    const existing = toolInputBuffersByIndex.get(event.index) || '';
+                    toolInputBuffersByIndex.set(event.index, existing + (event.delta.partial_json || ''));
                 }
             }
             
-            if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
-                toolCalls.push({
-                    type: 'tool_use',
-                    id: event.content_block.id,
-                    name: event.content_block.name,
-                    input: event.content_block.input,
-                });
+            if (emitToolUse && event.type === 'content_block_stop') {
+                const buffer = toolInputBuffersByIndex.get(event.index);
+                if (buffer !== undefined) {
+                    toolInputBuffersByIndex.delete(event.index);
+                    const toolId = toolIdByIndex.get(event.index);
+                    toolIdByIndex.delete(event.index);
+                    try {
+                        const parsed = JSON.parse(buffer || '{}');
+                        if (toolId && toolCallsById.has(toolId)) {
+                            toolCallsById.get(toolId).input = parsed;
+                        }
+                    } catch {
+                        // ignore
+                    }
+                }
             }
         }
         
         const contentArray = [];
-        if (content) {
-            contentArray.push({ type: 'text', text: content });
+        if (thinking) {
+            contentArray.push({ type: 'thinking', thinking });
         }
-        contentArray.push(...toolCalls);
+        if (text) {
+            contentArray.push({ type: 'text', text });
+        }
+        if (emitToolUse) {
+            for (const id of toolCallOrder) {
+                const call = toolCallsById.get(id);
+                if (call) contentArray.push(call);
+            }
+        }
         
         return {
             id: uuidv4(),
             type: 'message',
             role: 'assistant',
             model: model,
-            stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+            stop_reason: emitToolUse && toolCallOrder.length > 0 ? 'tool_use' : 'end_turn',
             stop_sequence: null,
             usage: {
                 input_tokens: 0,
@@ -1603,6 +2650,102 @@ ${userMessage}
     async listModels() {
         const models = ORCHIDS_MODELS.map(id => ({ name: id }));
         return { models };
+    }
+
+    getContentText(content) {
+        if (!content) return '';
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+            return content
+                .map((block) => {
+                    if (!block) return '';
+                    if (block.type === 'text') return block.text || '';
+                    if (block.type === 'tool_result') return this.getContentText(block.content);
+                    if (block.type === 'tool_use') return `${block.name || ''}\n${JSON.stringify(block.input || {})}`;
+                    if (block.type === 'thinking') return block.thinking || '';
+                    if (block.type === 'image') return '[image]';
+                    if (block.type === 'document') return '[document]';
+                    return '';
+                })
+                .filter(Boolean)
+                .join('\n');
+        }
+        if (typeof content === 'object') {
+            if (content.text) return String(content.text);
+        }
+        return '';
+    }
+
+    countTextTokens(text) {
+        if (!text) return 0;
+        try {
+            return anthropicCountTokens(String(text));
+        } catch {
+            return Math.ceil(String(text).length / 4);
+        }
+    }
+
+    estimateInputTokens(requestBody) {
+        return this.countTokens(requestBody).input_tokens;
+    }
+
+    countTokens(requestBody) {
+        let totalTokens = 0;
+
+        if (requestBody?.system) {
+            totalTokens += this.countTextTokens(this.getContentText(requestBody.system));
+        }
+
+        if (Array.isArray(requestBody?.messages)) {
+            for (const message of requestBody.messages) {
+                const content = message?.content;
+                if (!content) continue;
+                if (typeof content === 'string') {
+                    totalTokens += this.countTextTokens(content);
+                    continue;
+                }
+                if (!Array.isArray(content)) continue;
+                for (const block of content) {
+                    if (!block) continue;
+                    if (block.type === 'text' && block.text) {
+                        totalTokens += this.countTextTokens(block.text);
+                    } else if (block.type === 'tool_use') {
+                        totalTokens += this.countTextTokens(block.name || '');
+                        totalTokens += this.countTextTokens(JSON.stringify(block.input || {}));
+                    } else if (block.type === 'tool_result') {
+                        totalTokens += this.countTextTokens(this.getContentText(block.content));
+                    } else if (block.type === 'image') {
+                        totalTokens += 1600;
+                    } else if (block.type === 'document') {
+                        if (block.source?.data) {
+                            const estimatedChars = block.source.data.length * 0.75;
+                            totalTokens += Math.ceil(estimatedChars / 4);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (Array.isArray(requestBody?.tools)) {
+            for (const tool of requestBody.tools) {
+                totalTokens += this.countTextTokens(tool?.name || '');
+                totalTokens += this.countTextTokens(tool?.description || '');
+                if (tool?.input_schema) {
+                    totalTokens += this.countTextTokens(JSON.stringify(tool.input_schema));
+                }
+            }
+        }
+
+        return { input_tokens: totalTokens };
+    }
+
+    async getUsageLimits() {
+        if (!this.isInitialized) await this.initialize();
+        return {
+            supported: false,
+            provider: 'claude-orchids-oauth',
+            message: 'Orchids provider 暂无已知的稳定用量查询接口，返回占位结果。',
+        };
     }
 
     isExpiryDateNear() {

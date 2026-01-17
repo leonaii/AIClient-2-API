@@ -17,3 +17,7 @@ api-potluck-data.json
 configs/orchids/*_orchids_creds/
 configs/orchids/*.json
 !configs/orchids/*.example
+configs/orchidslog/
+external/
+docs/
+.trae/

@@ -45,9 +45,10 @@ const KIRO_CONSTANTS = {
 const KIRO_MODELS = getProviderModels('claude-kiro-oauth');
 
 // 完整的模型映射表
+// 注意：官方已移除 claude-opus-4.5，所有 opus 请求映射到 sonnet-4.5
 const FULL_MODEL_MAPPING = {
-    "claude-opus-4-5":"claude-opus-4.5",
-    "claude-opus-4-5-20251101":"claude-opus-4.5",
+    "claude-opus-4-5": "CLAUDE_SONNET_4_5_20250929_V1_0",
+    "claude-opus-4-5-20251101": "CLAUDE_SONNET_4_5_20250929_V1_0",
     "claude-haiku-4-5":"claude-haiku-4.5",
     "claude-sonnet-4-5": "CLAUDE_SONNET_4_5_20250929_V1_0",
     "claude-sonnet-4-5-20250929": "CLAUDE_SONNET_4_5_20250929_V1_0",

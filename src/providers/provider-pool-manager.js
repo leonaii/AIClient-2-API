@@ -190,14 +190,15 @@ export class ProviderPoolManager {
         }
 
         // 账号池上限：如果配置了 poolSizeLimit，只使用 Top N 个健康凭证
-        // 按 lastUsed 排序后取前 N 个，确保轮询范围受限
+        // 按 usageCount 降序排序，取使用次数最多的 Top N 个作为候选池
+        // 这样可以确保已经在使用的账号优先轮询，新加入的账号需要等待
         let candidateProviders = availableAndHealthyProviders;
         if (this.poolSizeLimit > 0 && availableAndHealthyProviders.length > this.poolSizeLimit) {
-            // 先按 usageCount 升序排序，取使用次数最少的 Top N 个作为候选池
+            // 按 usageCount 降序排序，取使用次数最多的 Top N 个作为候选池
             candidateProviders = [...availableAndHealthyProviders]
-                .sort((a, b) => (a.config.usageCount || 0) - (b.config.usageCount || 0))
+                .sort((a, b) => (b.config.usageCount || 0) - (a.config.usageCount || 0))
                 .slice(0, this.poolSizeLimit);
-            this._log('debug', `Pool size limited to ${this.poolSizeLimit}, using top ${candidateProviders.length} providers for ${providerType}`);
+            this._log('debug', `Pool size limited to ${this.poolSizeLimit}, using top ${candidateProviders.length} providers (by usage count) for ${providerType}`);
         }
 
         // 改进：使用"最久未被使用"策略（LRU）代替取模轮询
