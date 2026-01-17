@@ -25,9 +25,9 @@ export const PROVIDER_MODELS = {
     ],
     'claude-custom': [],
     'claude-kiro-oauth': [
+        'claude-haiku-4-5',
         'claude-opus-4-5',
         'claude-opus-4-5-20251101',
-        'claude-haiku-4-5',
         'claude-sonnet-4-5',
         'claude-sonnet-4-5-20250929',
         'claude-sonnet-4-20250514',
@@ -68,6 +68,17 @@ export const PROVIDER_MODELS = {
         'deepseek-v3.2',
         'deepseek-r1',
         'deepseek-v3'
+    ],
+    'openai-codex-oauth': [
+        'gpt-5',
+        'gpt-5-codex',
+        'gpt-5-codex-mini',
+        'gpt-5.1',
+        'gpt-5.1-codex',
+        'gpt-5.1-codex-mini',
+        'gpt-5.1-codex-max',
+        'gpt-5.2',
+        'gpt-5.2-codex'
     ]
 };
 

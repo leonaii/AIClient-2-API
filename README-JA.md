@@ -589,6 +589,13 @@ AIClient-2-APIプロジェクトに貢献してくれたすべての開発者に
 - [**落叶聚名**](https://github.com/mb5u88-debug "88")
 - [**匿名**](https://github.com/404 "8.88")
 
+### スキャンしてスポンサーになる
+
+あなたのスポンサーシップはプロジェクトの継続的な発展の原動力です ❤️
+
+<img src="static/coffee.png" alt="スキャンしてスポンサーになる" width="200">
+<img src="static/sponsor.png" alt="スキャンしてスポンサーになる" width="200">
+
 ### 🌟 Star History
 
 

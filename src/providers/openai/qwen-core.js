@@ -11,8 +11,8 @@ import { randomUUID } from 'node:crypto';
 import { getProviderModels } from '../provider-models.js';
 import { handleQwenOAuth } from '../../auth/oauth-handlers.js';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
-import { isRetryableNetworkError } from '../../utils/common.js';
-import { CredentialCacheManager } from '../../utils/credential-cache-manager.js';
+import { isRetryableNetworkError, MODEL_PROVIDER } from '../../utils/common.js';
+import { getProviderPoolManager } from '../../services/service-manager.js';
 
 // --- Constants ---
 const QWEN_DIR = '.qwen';
@@ -180,6 +180,7 @@ export class QwenApiService {
         this.currentAxiosInstance = null;
         this.tokenManagerOptions = { credentialFilePath: this._getQwenCachedCredentialPath() };
         this.useSystemProxy = config?.USE_SYSTEM_PROXY_QWEN ?? false;
+        this.uuid = config.uuid; // 保存 uuid 用于号池管理
         
         // Initialize instance-specific endpoints
         this.baseUrl = config.QWEN_BASE_URL || DEFAULT_QWEN_BASE_URL;
@@ -194,7 +195,9 @@ export class QwenApiService {
     async initialize() {
         if (this.isInitialized) return;
         console.log('[Qwen] Initializing Qwen API Service...');
-        await this._initializeAuth();
+        // 注意：V2 读写分离架构下，初始化不再执行同步认证/刷新逻辑
+        // 仅执行基础的凭证加载
+        await this.loadCredentials();
         
         // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
         const httpAgent = new http.Agent({
@@ -234,7 +237,29 @@ export class QwenApiService {
         console.log('[Qwen] Initialization complete.');
     }
 
+    /**
+     * 加载凭证信息（不执行刷新）
+     */
+    async loadCredentials() {
+        try {
+            const keyFile = this._getQwenCachedCredentialPath();
+            const creds = await fs.readFile(keyFile, 'utf-8');
+            const credentials = JSON.parse(creds);
+            this.qwenClient.setCredentials(credentials);
+            console.log('[Qwen Auth] Credentials loaded successfully from file.');
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                console.debug('[Qwen Auth] No cached credentials found.');
+            } else {
+                console.warn(`[Qwen Auth] Failed to load credentials from file: ${error.message}`);
+            }
+        }
+    }
+
     async _initializeAuth(forceRefresh = false) {
+        // 首先执行基础凭证加载
+        await this.loadCredentials();
+
         try {
             const credentials = await this.sharedManager.getValidCredentials(
                 this.qwenClient,
@@ -243,6 +268,14 @@ export class QwenApiService {
             );
             // console.log('credentials', credentials);
             this.qwenClient.setCredentials(credentials);
+
+            // 如果执行了刷新或认证，重置状态
+            if (forceRefresh || (credentials && credentials.access_token)) {
+                const poolManager = getProviderPoolManager();
+                if (poolManager && this.uuid) {
+                    poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.QWEN_API, this.uuid);
+                }
+            }
         } catch (error) {
             console.debug('Shared token manager failed, attempting device flow:', error);
 
@@ -289,8 +322,21 @@ export class QwenApiService {
                     default:
                         throw new Error('Qwen OAuth authentication failed');
                 }
+            } else {
+                // 认证成功，重置状态
+                const poolManager = getProviderPoolManager();
+                if (poolManager && this.uuid) {
+                    poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.QWEN_API, this.uuid);
+                }
             }
         }
+    }
+
+    /**
+     * 实现与其它 provider 统一的 initializeAuth 接口
+     */
+    async initializeAuth(forceRefresh = false) {
+        return this._initializeAuth(forceRefresh);
     }
     
     async _authWithQwenDeviceFlow(client, config) {
@@ -389,18 +435,14 @@ export class QwenApiService {
 
     async _cacheQwenCredentials(credentials) {
         const filePath = this._getQwenCachedCredentialPath();
-        const credentialCache = CredentialCacheManager.getInstance();
-        // 使用内存锁替代文件锁，防止并发写入
-        await credentialCache.withMemoryLock(`qwen-cache:${filePath}`, async () => {
-            try {
-                await fs.mkdir(path.dirname(filePath), { recursive: true });
-                const credString = JSON.stringify(credentials, null, 2);
-                await fs.writeFile(filePath, credString);
-                console.log(`[Qwen Auth] Credentials cached to ${filePath}`);
-            } catch (error) {
-                console.error(`[Qwen Auth] Failed to cache credentials to ${filePath}: ${error.message}`);
-            }
-        });
+        try {
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            const credString = JSON.stringify(credentials, null, 2);
+            await fs.writeFile(filePath, credString);
+            console.log(`[Qwen Auth] Credentials cached to ${filePath}`);
+        } catch (error) {
+            console.error(`[Qwen Auth] Failed to cache credentials to ${filePath}: ${error.message}`);
+        }
     }
     
     getCurrentEndpoint(resourceUrl) {
@@ -568,18 +610,22 @@ export class QwenApiService {
             const isNetworkError = isRetryableNetworkError(error);
 
             if (this.isAuthError(error) && retryCount === 0) {
-                console.warn(`[QwenApiService] Auth error (${status}). Refreshing token...`);
-                try {
-                    await this.sharedManager.getValidCredentials(
-                        this.qwenClient,
-                        true,
-                        this.tokenManagerOptions,
-                    );
-                    return this.callApiWithAuthAndRetry(endpoint, body, isStream, retryCount + 1);
-                } catch (refreshError) {
-                    console.error(`[QwenApiService] Token refresh failed:`, refreshError);
-                    throw new Error(`Token refresh failed. Please re-authenticate. ${refreshError.message}`);
+                console.warn(`[QwenApiService] Auth error (${status}). Triggering background refresh via PoolManager...`);
+                
+                // 标记当前凭证为不健康（会自动进入刷新队列）
+                const poolManager = getProviderPoolManager();
+                if (poolManager && this.uuid) {
+                    console.log(`[Qwen] Marking credential ${this.uuid} as needs refresh. Reason: Auth Error ${status}`);
+                    poolManager.markProviderNeedRefresh(MODEL_PROVIDER.QWEN_API, {
+                        uuid: this.uuid
+                    });
+                    error.credentialMarkedUnhealthy = true;
                 }
+
+                // Mark error for credential switch without recording error count
+                error.shouldSwitchCredential = true;
+                error.skipErrorCount = true;
+                throw error;
             }
 
             if ((status === 429 || (status >= 500 && status < 600)) && retryCount < maxRetries) {
@@ -794,77 +840,39 @@ class SharedTokenManager {
             throw new TokenManagerError(TokenError.NO_REFRESH_TOKEN, 'No refresh token available');
         }
 
-        // 获取凭证缓存管理器
-        const credentialCache = CredentialCacheManager.getInstance();
-        const providerType = 'openai-qwen-oauth';
-
-        // 使用内存锁进行去重
-        const dedupeKey = `qwen-token-refresh:${context.credentialFilePath}`;
-
         try {
-            const credentials = await credentialCache.withDeduplication(dedupeKey, async () => {
-                await this.acquireLock(context);
-                try {
-                    // 优先从全局缓存检查
-                    if (context.uuid && credentialCache.hasCredentials(providerType, context.uuid)) {
-                        const cachedEntry = credentialCache.getCredentials(providerType, context.uuid);
-                        if (cachedEntry && cachedEntry.credentials && !forceRefresh && this.isTokenValid(cachedEntry.credentials)) {
-                            context.memoryCache.credentials = cachedEntry.credentials;
-                            qwenClient.setCredentials(cachedEntry.credentials);
-                            return cachedEntry.credentials;
-                        }
-                    }
+            await this.acquireLock(context);
+            try {
+                await this.checkAndReloadIfNeeded(context);
 
-                    await this.checkAndReloadIfNeeded(context);
-
-                    if (!forceRefresh && context.memoryCache.credentials && this.isTokenValid(context.memoryCache.credentials)) {
-                        qwenClient.setCredentials(context.memoryCache.credentials);
-                        return context.memoryCache.credentials;
-                    }
-
-                    const response = await qwenClient.refreshAccessToken();
-                    if (!response || isErrorResponse(response)) {
-                        throw new TokenManagerError(TokenError.REFRESH_FAILED, `Token refresh failed: ${response?.error}`);
-                    }
-                    if (!response.access_token) {
-                        throw new TokenManagerError(TokenError.REFRESH_FAILED, 'No access token in refresh response');
-                    }
-                    const newCredentials = {
-                        access_token: response.access_token,
-                        token_type: response.token_type,
-                        refresh_token: response.refresh_token || currentCredentials.refresh_token,
-                        resource_url: response.resource_url,
-                        expiry_date: Date.now() + response.expires_in * 1000,
-                    };
-
-                    context.memoryCache.credentials = newCredentials;
-                    qwenClient.setCredentials(newCredentials);
-                    await this.saveCredentialsToFile(context, newCredentials);
-                    console.log('[Qwen Auth] Token refresh response: ok');
-                    return newCredentials;
-                } finally {
-                    await this.releaseLock(context);
+                if (!forceRefresh && context.memoryCache.credentials && this.isTokenValid(context.memoryCache.credentials)) {
+                    qwenClient.setCredentials(context.memoryCache.credentials);
+                    return context.memoryCache.credentials;
                 }
-            });
 
-            // 如果是等待其他请求完成的刷新，需要重新加载凭证
-            if (!context.memoryCache.credentials || !this.isTokenValid(context.memoryCache.credentials)) {
-                // 优先从全局缓存加载
-                if (context.uuid && credentialCache.hasCredentials(providerType, context.uuid)) {
-                    const cachedEntry = credentialCache.getCredentials(providerType, context.uuid);
-                    if (cachedEntry && cachedEntry.credentials) {
-                        context.memoryCache.credentials = cachedEntry.credentials;
-                        qwenClient.setCredentials(cachedEntry.credentials);
-                    }
-                } else {
-                    await this.reloadCredentialsFromFile(context);
-                    if (context.memoryCache.credentials) {
-                        qwenClient.setCredentials(context.memoryCache.credentials);
-                    }
+                const response = await qwenClient.refreshAccessToken();
+                if (!response || isErrorResponse(response)) {
+                    throw new TokenManagerError(TokenError.REFRESH_FAILED, `Token refresh failed: ${response?.error}`);
                 }
+                if (!response.access_token) {
+                    throw new TokenManagerError(TokenError.REFRESH_FAILED, 'No access token in refresh response');
+                }
+                const newCredentials = {
+                    access_token: response.access_token,
+                    token_type: response.token_type,
+                    refresh_token: response.refresh_token || currentCredentials.refresh_token,
+                    resource_url: response.resource_url,
+                    expiry_date: Date.now() + response.expires_in * 1000,
+                };
+
+                context.memoryCache.credentials = newCredentials;
+                qwenClient.setCredentials(newCredentials);
+                await this.saveCredentialsToFile(context, newCredentials);
+                console.log('[Qwen Auth] Token refresh response: ok');
+                return newCredentials;
+            } finally {
+                await this.releaseLock(context);
             }
-
-            return credentials;
         } catch (error) {
             if (error instanceof TokenManagerError) throw error;
 
@@ -890,26 +898,14 @@ class SharedTokenManager {
     }
     
     async saveCredentialsToFile(context, credentials) {
-        // 优先更新内存缓存
-        const credentialCache = CredentialCacheManager.getInstance();
-        const providerType = 'openai-qwen-oauth';
-
-        if (context.uuid && credentialCache.hasCredentials(providerType, context.uuid)) {
-            credentialCache.updateCredentials(providerType, context.uuid, credentials, context.credentialFilePath);
-            console.info(`[Qwen Auth] Updated credentials in memory cache: ${context.uuid}`);
-            // 同时更新本地内存缓存
-            context.memoryCache.credentials = credentials;
-            context.memoryCache.fileModTime = Date.now();
-            return;
-        }
-
-        // 回退到使用内存锁写入文件
-        await credentialCache.withMemoryLock(`qwen-save:${context.credentialFilePath}`, async () => {
+        try {
             await fs.mkdir(path.dirname(context.credentialFilePath), { recursive: true, mode: 0o700 });
             await fs.writeFile(context.credentialFilePath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
             const stats = await fs.stat(context.credentialFilePath);
             context.memoryCache.fileModTime = stats.mtimeMs;
-        });
+        } catch (error) {
+            console.error(`[Qwen Auth] Failed to save credentials to ${context.credentialFilePath}: ${error.message}`);
+        }
     }
 
     isTokenValid(credentials) {

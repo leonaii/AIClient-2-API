@@ -11,7 +11,6 @@ import { countTokens } from '@anthropic-ai/tokenizer';
 import { configureAxiosProxy } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
-import { CredentialCacheManager } from '../../utils/credential-cache-manager.js';
 
 const KIRO_THINKING = {
     MAX_BUDGET_TOKENS: 24576,
@@ -62,22 +61,6 @@ const MODEL_MAPPING = Object.fromEntries(
 );
 
 const KIRO_AUTH_TOKEN_FILE = "kiro-auth-token.json";
-
-/**
- * 自定义凭证错误类
- * 用于标识需要切换凭证的错误
- */
-class CredentialError extends Error {
-    constructor(message, options = {}) {
-        super(message);
-        this.name = 'CredentialError';
-        this.shouldSwitchCredential = options.shouldSwitchCredential ?? false;
-        this.skipErrorCount = options.skipErrorCount ?? false;
-        this.credentialMarkedUnhealthy = options.credentialMarkedUnhealthy ?? false;
-        this.statusCode = options.statusCode;
-        this.originalError = options.originalError;
-    }
-}
 
 /**
  * Kiro API Service - Node.js implementation based on the Python ki2api
@@ -405,7 +388,10 @@ export class KiroApiService {
     async initialize() {
         if (this.isInitialized) return;
         console.log('[Kiro] Initializing Kiro API Service...');
-        await this.initializeAuth();
+        // 注意：V2 读写分离架构下，初始化不再执行同步认证/刷新逻辑
+        // 仅执行基础的凭证加载
+        await this.loadCredentials();
+        
         // 根据当前加载的凭证生成唯一的 Machine ID
         const machineId = generateMachineIdFromConfig({
             uuid: this.uuid,
@@ -460,20 +446,14 @@ export class KiroApiService {
         this.isInitialized = true;
     }
 
-async initializeAuth(forceRefresh = false) {
-    if (this.accessToken && !forceRefresh) {
-        console.debug('[Kiro Auth] Access token already available and not forced refresh.');
-        return;
-    }
-
-    // 获取凭证文件路径，用于去重锁的 key
+/**
+ * 加载凭证信息（不执行刷新）
+ */
+async loadCredentials() {
+    // 获取凭证文件路径
     const tokenFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
 
-    // 获取凭证缓存管理器
-    const credentialCache = CredentialCacheManager.getInstance();
-    const providerType = 'claude-kiro-oauth';
-
-    // Helper to load credentials from a file (fallback when cache miss)
+    // Helper to load credentials from a file
     const loadCredentialsFromFile = async (filePath) => {
         try {
             const fileContent = await fs.readFile(filePath, 'utf8');
@@ -508,57 +488,6 @@ async initializeAuth(forceRefresh = false) {
         }
     };
 
-    // Helper to save credentials - 使用内存缓存替代直接文件写入
-    const saveCredentialsToFile = async (filePath, newData) => {
-        // 优先更新内存缓存
-        if (this.uuid && credentialCache.hasCredentials(providerType, this.uuid)) {
-            const entry = credentialCache.getCredentials(providerType, this.uuid);
-            if (entry) {
-                const mergedData = { ...entry.credentials, ...newData };
-                credentialCache.updateCredentials(providerType, this.uuid, mergedData, filePath);
-                console.info(`[Kiro Auth] Updated credentials in memory cache: ${this.uuid}`);
-                return;
-            }
-        }
-
-        // 如果没有缓存条目，使用内存锁方式写入
-        await credentialCache.withMemoryLock(`kiro-save:${filePath}`, async () => {
-            let existingData = {};
-            try {
-                const fileContent = await fs.readFile(filePath, 'utf8');
-                try {
-                    existingData = JSON.parse(fileContent);
-                } catch (parseError) {
-                    console.warn('[Kiro Auth] JSON parse failed, attempting repair...');
-                    try {
-                        const repaired = repairJson(fileContent);
-                        existingData = JSON.parse(repaired);
-                        console.info('[Kiro Auth] JSON repair successful');
-                    } catch (repairError) {
-                        console.warn('[Kiro Auth] JSON repair failed, attempting field extraction...');
-                        const extracted = extractCredentialsFromCorruptedJson(fileContent);
-                        if (extracted) {
-                            existingData = extracted;
-                            console.info('[Kiro Auth] Field extraction successful');
-                        } else {
-                            console.error('[Kiro Auth] All recovery methods failed:', repairError.message);
-                            existingData = {};
-                        }
-                    }
-                }
-            } catch (readError) {
-                if (readError.code === 'ENOENT') {
-                    console.debug(`[Kiro Auth] Token file not found, creating new one: ${filePath}`);
-                } else {
-                    console.warn(`[Kiro Auth] Could not read existing token file ${filePath}: ${readError.message}`);
-                }
-            }
-            const mergedData = { ...existingData, ...newData };
-            await fs.writeFile(filePath, JSON.stringify(mergedData, null, 2), 'utf8');
-            console.info(`[Kiro Auth] Updated token file: ${filePath}`);
-        });
-    };
-
     try {
         let mergedCredentials = {};
 
@@ -569,43 +498,34 @@ async initializeAuth(forceRefresh = false) {
             this.base64Creds = null;
         }
 
-        // Priority 2: 尝试从内存缓存加载凭证
-        if (this.uuid && credentialCache.hasCredentials(providerType, this.uuid)) {
-            const cachedEntry = credentialCache.getCredentials(providerType, this.uuid);
-            if (cachedEntry && cachedEntry.credentials) {
-                Object.assign(mergedCredentials, cachedEntry.credentials);
-                console.info(`[Kiro Auth] Successfully loaded credentials from memory cache: ${this.uuid}`);
+        // 从文件加载
+        const targetFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
+        const dirPath = path.dirname(targetFilePath);
+        const targetFileName = path.basename(targetFilePath);
+
+        console.debug(`[Kiro Auth] Loading credentials from directory: ${dirPath}`);
+
+        try {
+            const targetCredentials = await loadCredentialsFromFile(targetFilePath);
+            if (targetCredentials) {
+                Object.assign(mergedCredentials, targetCredentials);
+                console.info(`[Kiro Auth] Successfully loaded OAuth credentials from ${targetFilePath}`);
             }
-        } else {
-            // Priority 3: 从文件加载（缓存未命中时的回退）
-            const targetFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
-            const dirPath = path.dirname(targetFilePath);
-            const targetFileName = path.basename(targetFilePath);
 
-            console.debug(`[Kiro Auth] Cache miss, loading credentials from directory: ${dirPath}`);
-
-            try {
-                const targetCredentials = await loadCredentialsFromFile(targetFilePath);
-                if (targetCredentials) {
-                    Object.assign(mergedCredentials, targetCredentials);
-                    console.info(`[Kiro Auth] Successfully loaded OAuth credentials from ${targetFilePath}`);
-                }
-
-                const files = await fs.readdir(dirPath);
-                for (const file of files) {
-                    if (file.endsWith('.json') && file !== targetFileName) {
-                        const filePath = path.join(dirPath, file);
-                        const credentials = await loadCredentialsFromFile(filePath);
-                        if (credentials) {
-                            credentials.expiresAt = mergedCredentials.expiresAt;
-                            Object.assign(mergedCredentials, credentials);
-                            console.debug(`[Kiro Auth] Loaded Client credentials from ${file}`);
-                        }
+            const files = await fs.readdir(dirPath);
+            for (const file of files) {
+                if (file.endsWith('.json') && file !== targetFileName) {
+                    const filePath = path.join(dirPath, file);
+                    const credentials = await loadCredentialsFromFile(filePath);
+                    if (credentials) {
+                        credentials.expiresAt = mergedCredentials.expiresAt;
+                        Object.assign(mergedCredentials, credentials);
+                        console.debug(`[Kiro Auth] Loaded Client credentials from ${file}`);
                     }
                 }
-            } catch (error) {
-                console.warn(`[Kiro Auth] Error loading credentials from directory ${dirPath}: ${error.message}`);
             }
+        } catch (error) {
+            console.warn(`[Kiro Auth] Error loading credentials from directory ${dirPath}: ${error.message}`);
         }
 
         // Apply loaded credentials
@@ -630,28 +550,71 @@ async initializeAuth(forceRefresh = false) {
     } catch (error) {
         console.warn(`[Kiro Auth] Error during credential loading: ${error.message}`);
     }
+}
 
-    // Refresh token if forced or if access token is missing but refresh token is available
+async initializeAuth(forceRefresh = false) {
+    if (this.accessToken && !forceRefresh) {
+        console.debug('[Kiro Auth] Access token already available and not forced refresh.');
+        return;
+    }
+
+    // 首先执行基础凭证加载
+    await this.loadCredentials();
+
+    // 只有在明确要求强制刷新，或者 AccessToken 确实缺失时，才执行刷新
+    // 注意：在 V2 架构下，此方法主要由 PoolManager 的后台队列调用
     if (forceRefresh || (!this.accessToken && this.refreshToken)) {
         if (!this.refreshToken) {
             throw new Error('No refresh token available to refresh access token.');
         }
 
-        // 使用内存锁替代文件锁进行去重
-        const dedupeKey = `kiro-token-refresh:${tokenFilePath}`;
-        await credentialCache.withDeduplication(dedupeKey, async () => {
-            await this._doTokenRefresh(saveCredentialsToFile, tokenFilePath);
-        });
-
-        // 刷新完成后（无论是自己执行还是等待其他请求），都从缓存重新加载凭证
-        // 确保所有并发请求都能获取到最新的 token
-        await this._reloadCredentialsAfterRefresh(tokenFilePath);
+        const tokenFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
+        await this._doTokenRefresh(this.saveCredentialsToFile.bind(this), tokenFilePath);
     }
 
     if (!this.accessToken) {
         throw new Error('No access token available after initialization and refresh attempts.');
     }
 }
+
+/**
+ * Helper to save credentials
+ */
+async saveCredentialsToFile(filePath, newData) {
+    let existingData = {};
+    try {
+        const fileContent = await fs.readFile(filePath, 'utf8');
+        try {
+            existingData = JSON.parse(fileContent);
+        } catch (parseError) {
+            console.warn('[Kiro Auth] JSON parse failed, attempting repair...');
+            try {
+                const repaired = repairJson(fileContent);
+                existingData = JSON.parse(repaired);
+                console.info('[Kiro Auth] JSON repair successful');
+            } catch (repairError) {
+                console.warn('[Kiro Auth] JSON repair failed, attempting field extraction...');
+                const extracted = extractCredentialsFromCorruptedJson(fileContent);
+                if (extracted) {
+                    existingData = extracted;
+                    console.info('[Kiro Auth] Field extraction successful');
+                } else {
+                    console.error('[Kiro Auth] All recovery methods failed:', repairError.message);
+                    existingData = {};
+                }
+            }
+        }
+    } catch (readError) {
+        if (readError.code === 'ENOENT') {
+            console.debug(`[Kiro Auth] Token file not found, creating new one: ${filePath}`);
+        } else {
+            console.warn(`[Kiro Auth] Could not read existing token file ${filePath}: ${readError.message}`);
+        }
+    }
+    const mergedData = { ...existingData, ...newData };
+    await fs.writeFile(filePath, JSON.stringify(mergedData, null, 2), 'utf8');
+    console.info(`[Kiro Auth] Updated token file: ${filePath}`);
+};
 
     /**
      * 执行实际的 token 刷新操作（内部方法）
@@ -701,6 +664,12 @@ async initializeAuth(forceRefresh = false) {
                     updatedTokenData.profileArn = this.profileArn;
                 }
                 await saveCredentialsToFile(tokenFilePath, updatedTokenData);
+
+                // 刷新成功，重置 PoolManager 中的刷新状态并标记为健康
+                const poolManager = getProviderPoolManager();
+                if (poolManager && this.uuid) {
+                    poolManager.resetProviderRefreshStatus(MODEL_PROVIDER.KIRO_API, this.uuid);
+                }
             } else {
                 throw new Error('Invalid refresh response: Missing accessToken');
             }
@@ -710,58 +679,6 @@ async initializeAuth(forceRefresh = false) {
         }
     }
 
-    /**
-     * 在并发刷新完成后重新加载凭证（内部方法）
-     * @param {string} tokenFilePath - 凭证文件路径
-     */
-    async _reloadCredentialsAfterRefresh(tokenFilePath) {
-        // 优先从内存缓存加载
-        const credentialCache = CredentialCacheManager.getInstance();
-        const providerType = 'claude-kiro-oauth';
-
-        if (this.uuid && credentialCache.hasCredentials(providerType, this.uuid)) {
-            const cachedEntry = credentialCache.getCredentials(providerType, this.uuid);
-            if (cachedEntry && cachedEntry.credentials) {
-                this.accessToken = cachedEntry.credentials.accessToken;
-                this.refreshToken = cachedEntry.credentials.refreshToken;
-                this.expiresAt = cachedEntry.credentials.expiresAt;
-                if (cachedEntry.credentials.profileArn) {
-                    this.profileArn = cachedEntry.credentials.profileArn;
-                }
-                console.debug('[Kiro Auth] Credentials reloaded from memory cache after concurrent refresh');
-                return;
-            }
-        }
-
-        // 回退到文件加载
-        try {
-            const fileContent = await fs.readFile(tokenFilePath, 'utf8');
-            let credentials;
-            try {
-                credentials = JSON.parse(fileContent);
-            } catch (parseError) {
-                console.warn('[Kiro Auth] JSON parse failed, attempting repair...');
-                try {
-                    const repaired = repairJson(fileContent);
-                    credentials = JSON.parse(repaired);
-                    console.info('[Kiro Auth] JSON repair successful');
-                } catch (repairError) {
-                    console.error('[Kiro Auth] JSON repair failed:', repairError.message);
-                    throw new Error(`Failed to parse credentials file after repair attempt: ${repairError.message}`);
-                }
-            }
-            this.accessToken = credentials.accessToken;
-            this.refreshToken = credentials.refreshToken;
-            this.expiresAt = credentials.expiresAt;
-            if (credentials.profileArn) {
-                this.profileArn = credentials.profileArn;
-            }
-            console.debug('[Kiro Auth] Credentials reloaded from file after concurrent refresh');
-        } catch (error) {
-            console.warn(`[Kiro Auth] Failed to reload credentials after refresh: ${error.message}`);
-            throw error;
-        }
-    }
 
     /**
      * Extract text content from OpenAI message format
@@ -1413,7 +1330,7 @@ async initializeAuth(forceRefresh = false) {
             
             // Handle 401 (Unauthorized) - refresh UUID first, then try to refresh token
             if (status === 401 && !isRetry) {
-                console.log('[Kiro] Received 401. Refreshing UUID and attempting token refresh...');
+                console.log('[Kiro] Received 401. Refreshing UUID and triggering background refresh via PoolManager...');
                 
                 // 1. 先刷新 UUID
                 const newUuid = this._refreshUuid();
@@ -1422,17 +1339,12 @@ async initializeAuth(forceRefresh = false) {
                     this.uuid = newUuid;
                 }
                 
-                // 2. 尝试刷新 token
-                try {
-                    await this.initializeAuth(true); // Force refresh token
-                    console.log('[Kiro] Token refresh successful after 401, retrying request with new UUID...');
-                    return this.callApi(method, model, body, true, retryCount);
-                } catch (refreshError) {
-                    console.error('[Kiro] Token refresh failed during 401 retry:', refreshError.message);
-                    // 3. 刷新失败，标记凭证不健康，让上层切换到其他凭证
-                    this._markCredentialUnhealthy('401 Unauthorized - Token refresh failed', refreshError);
-                    throw refreshError;
-                }
+                // 标记当前凭证为不健康（会自动进入刷新队列）
+                this._markCredentialNeedRefresh('401 Unauthorized - Triggering auto-refresh');
+                // Mark error for credential switch without recording error count
+                error.shouldSwitchCredential = true;
+                error.skipErrorCount = true;
+                throw error;
             }
     
             // Handle 402 (Payment Required / Quota Exceeded) - verify usage and mark as unhealthy with recovery time
@@ -1510,6 +1422,32 @@ async initializeAuth(forceRefresh = false) {
      * @returns {boolean} - Whether the credential was successfully marked as unhealthy
      * @private
      */
+    _markCredentialNeedRefresh(reason, error = null) {
+        const poolManager = getProviderPoolManager();
+        if (poolManager && this.uuid) {
+            console.log(`[Kiro] Marking credential ${this.uuid} as needs refresh. Reason: ${reason}`);
+            // 使用新的 markProviderNeedRefresh 方法代替 markProviderUnhealthyImmediately
+            poolManager.markProviderNeedRefresh(MODEL_PROVIDER.KIRO_API, {
+                uuid: this.uuid
+            });
+            // Attach marker to error object to prevent duplicate marking in upper layers
+            if (error) {
+                error.credentialMarkedUnhealthy = true;
+            }
+            return true;
+        } else {
+            console.warn(`[Kiro] Cannot mark credential as unhealthy: poolManager=${!!poolManager}, uuid=${this.uuid}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Helper method to mark the current credential as unhealthy
+     * @param {string} reason - The reason for marking unhealthy
+     * @param {Error} [error] - Optional error object to attach the marker to
+     * @returns {boolean} - Whether the credential was successfully marked as unhealthy
+     * @private
+     */
     _markCredentialUnhealthy(reason, error = null) {
         const poolManager = getProviderPoolManager();
         if (poolManager && this.uuid) {
@@ -1580,15 +1518,10 @@ async initializeAuth(forceRefresh = false) {
             const usageLimits = await this.getUsageLimits();
             const isQuotaExhausted = usageLimits?.usedCount >= usageLimits?.limitCount;
             
-            if (isQuotaExhausted) {
-                console.log(`[Kiro] Quota confirmed exhausted: ${usageLimits?.usedCount}/${usageLimits?.limitCount}`);
-                // Calculate recovery time: 1st day of next month at 00:00:00 UTC
-                const nextMonth = this._getNextMonthFirstDay();
-                this._markCredentialUnhealthyWithRecovery('402 Payment Required - Quota Exhausted', error, nextMonth);
-            } else {
-                console.log(`[Kiro] Quota not exhausted (${usageLimits?.usedCount}/${usageLimits?.limitCount}), but received 402. Marking unhealthy anyway.`);
-                this._markCredentialUnhealthy('402 Payment Required - Unexpected', error);
-            }
+            console.log(`[Kiro] Quota confirmed exhausted: ${usageLimits?.usedCount}/${usageLimits?.limitCount}`);
+            // Calculate recovery time: 1st day of next month at 00:00:00 UTC
+            const nextMonth = this._getNextMonthFirstDay();
+            this._markCredentialUnhealthyWithRecovery('402 Payment Required - Quota Exhausted', error, nextMonth);
         } catch (usageError) {
             console.warn('[Kiro] Failed to verify usage limits:', usageError.message);
             // If we can't verify, still mark as unhealthy with recovery time
@@ -1649,13 +1582,13 @@ async initializeAuth(forceRefresh = false) {
         // Token 刷新策略：
         // 1. 已过期 → 必须等待刷新
         // 2. 即将过期但还能用 → 后台异步刷新，不阻塞当前请求
-        if (this.isTokenExpired()) {
-            console.log('[Kiro] Token is expired, must refresh before generateContent request...');
-            await this.initializeAuth(true);
-        } else if (this.isExpiryDateNear()) {
-            console.log('[Kiro] Token is near expiry, triggering background refresh...');
-            this.triggerBackgroundRefresh();
-        }
+        // if (this.isTokenExpired()) {
+        //     console.log('[Kiro] Token is expired, must refresh before generateContent request...');
+        //     await this.initializeAuth(true);
+        // } else if (this.isExpiryDateNear()) {
+        //     console.log('[Kiro] Token is near expiry, triggering background refresh...');
+        //     this.triggerBackgroundRefresh();
+        // }
         
         const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
         console.log(`[Kiro] Calling generateContent with model: ${finalModel}`);
@@ -1906,18 +1839,20 @@ async initializeAuth(forceRefresh = false) {
             
             // Handle 401 (Unauthorized) - try to refresh token first
             if (status === 401 && !isRetry) {
-                console.log('[Kiro] Received 401 in stream. Attempting token refresh...');
-                try {
-                    await this.initializeAuth(true); // Force refresh token
-                    console.log('[Kiro] Token refresh successful after 401, retrying stream...');
-                    yield* this.streamApiReal(method, model, body, true, retryCount);
-                    return;
-                } catch (refreshError) {
-                    console.error('[Kiro] Token refresh failed during 401 retry:', refreshError.message);
-                    // Mark credential as unhealthy immediately and attach marker to error
-                    this._markCredentialUnhealthy('401 Unauthorized - Token refresh failed', refreshError);
-                    throw refreshError;
+                console.log('[Kiro] Received 401 in stream. Triggering background refresh via PoolManager...');
+                
+                // 1. 先刷新 UUID
+                const newUuid = this._refreshUuid();
+                if (newUuid) {
+                    console.log(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+                    this.uuid = newUuid;
                 }
+                // 标记当前凭证为不健康（会自动进入刷新队列）
+                this._markCredentialNeedRefresh('401 Unauthorized in stream - Triggering auto-refresh');
+                // Mark error for credential switch without recording error count
+                error.shouldSwitchCredential = true;
+                error.skipErrorCount = true;
+                throw error;
             }
             
             // Handle 402 (Payment Required / Quota Exceeded) - verify usage and mark as unhealthy with recovery time
@@ -1992,13 +1927,13 @@ async initializeAuth(forceRefresh = false) {
         // Token 刷新策略：
         // 1. 已过期 → 必须等待刷新
         // 2. 即将过期但还能用 → 后台异步刷新，不阻塞当前请求
-        if (this.isTokenExpired()) {
-            console.log('[Kiro] Token is expired, must refresh before generateContentStream request...');
-            await this.initializeAuth(true);
-        } else if (this.isExpiryDateNear()) {
-            console.log('[Kiro] Token is near expiry, triggering background refresh...');
-            this.triggerBackgroundRefresh();
-        }
+        // if (this.isTokenExpired()) {
+        //     console.log('[Kiro] Token is expired, must refresh before generateContentStream request...');
+        //     await this.initializeAuth(true);
+        // } else if (this.isExpiryDateNear()) {
+        //     console.log('[Kiro] Token is near expiry, triggering background refresh...');
+        //     this.triggerBackgroundRefresh();
+        // }
         
         const finalModel = MODEL_MAPPING[model] ? model : this.modelName;
         console.log(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
@@ -2658,22 +2593,12 @@ async initializeAuth(forceRefresh = false) {
      * 后台异步刷新 token（不阻塞当前请求）
      */
     triggerBackgroundRefresh() {
-        const tokenFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AH_TOKEN_FILE);
-        const dedupeKey = `kiro-token-refresh:${tokenFilePath}`;
-        const credentialCache = CredentialCacheManager.getInstance();
-
-        // 使用 withDeduplication 确保只有一个刷新任务在执行
-        credentialCache.withDeduplication(dedupeKey, async () => {
-            console.log('[Kiro] Background token refresh started...');
-            try {
-                await this.initializeAuth(true);
-                console.log('[Kiro] Background token refresh completed successfully');
-            } catch (error) {
-                console.error('[Kiro] Background token refresh failed:', error.message);
-                // 后台刷新失败不抛出错误，下次请求会重试
-            }
-        }).catch(() => {
-            // 忽略后台刷新错误，不影响当前请求
+        console.log('[Kiro] Background token refresh started...');
+        this.initializeAuth(true).then(() => {
+            console.log('[Kiro] Background token refresh completed successfully');
+        }).catch((error) => {
+            console.error('[Kiro] Background token refresh failed:', error.message);
+            // 后台刷新失败不抛出错误，下次请求会重试
         });
     }
 
@@ -2754,13 +2679,13 @@ async initializeAuth(forceRefresh = false) {
         // Token 刷新策略：
         // 1. 已过期 → 必须等待刷新
         // 2. 即将过期但还能用 → 后台异步刷新，不阻塞当前请求
-        if (this.isTokenExpired()) {
-            console.log('[Kiro] Token is expired, must refresh before getUsageLimits request...');
-            await this.initializeAuth(true);
-        } else if (this.isExpiryDateNear()) {
-            console.log('[Kiro] Token is near expiry, triggering background refresh...');
-            this.triggerBackgroundRefresh();
-        }
+        // if (this.isTokenExpired()) {
+        //     console.log('[Kiro] Token is expired, must refresh before getUsageLimits request...');
+        //     await this.initializeAuth(true);
+        // } else if (this.isExpiryDateNear()) {
+        //     console.log('[Kiro] Token is near expiry, triggering background refresh...');
+        //     this.triggerBackgroundRefresh();
+        // }
         
         // 内部固定的资源类型
         const resourceType = 'AGENTIC_REQUEST';
@@ -2824,7 +2749,7 @@ async initializeAuth(forceRefresh = false) {
             // 对于用量查询，401/403 错误直接标记凭证为不健康，不重试
             if (status === 401) {
                 console.log('[Kiro] Received 401 on getUsageLimits. Marking credential as unhealthy (no retry)...');
-                this._markCredentialUnhealthy('401 Unauthorized on usage query', formattedError);
+                this._markCredentialNeedRefresh('401 Unauthorized on usage query', formattedError);
                 throw formattedError;
             }
             
