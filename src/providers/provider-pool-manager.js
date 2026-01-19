@@ -1,4 +1,5 @@
 import * as fs from 'fs'; // Import fs module
+import * as crypto from 'crypto'; // Import crypto module for UUID generation
 import { getServiceAdapter } from './adapter.js';
 import { MODEL_PROVIDER, getProtocolPrefix } from '../utils/common.js';
 import { getProviderModels } from './provider-models.js';
@@ -8,26 +9,29 @@ import axios from 'axios';
  * Manages a pool of API service providers, handling their health and selection.
  */
 export class ProviderPoolManager {
-        // 默认健康检查模型配置
-        // 键名必须与 MODEL_PROVIDER 常量值一致
-        static DEFAULT_HEALTH_CHECK_MODELS = {
-            'gemini-cli-oauth': 'gemini-2.5-flash',
-            'gemini-antigravity': 'gemini-2.5-flash',
-            'openai-custom': 'gpt-3.5-turbo',
-            'claude-custom': 'claude-3-7-sonnet-20250219',
-            'claude-kiro-oauth': 'claude-haiku-4-5',
-            'openai-qwen-oauth': 'qwen3-coder-flash',
-            'openaiResponses-custom': 'gpt-4o-mini'
-        };
+    // 默认健康检查模型配置
+    // 键名必须与 MODEL_PROVIDER 常量值一致
+    static DEFAULT_HEALTH_CHECK_MODELS = {
+        'gemini-cli-oauth': 'gemini-2.5-flash',
+        'gemini-antigravity': 'gemini-2.5-flash',
+        'openai-custom': 'gpt-3.5-turbo',
+        'claude-custom': 'claude-3-7-sonnet-20250219',
+        'claude-kiro-oauth': 'claude-haiku-4-5',
+        'claude-orchids-oauth': 'claude-haiku-4-5',
+        'openai-qwen-oauth': 'qwen3-coder-flash',
+        'openai-iflow': 'qwen3-coder-plus',
+        'openai-codex-oauth': 'gpt-5-codex-mini',
+        'openaiResponses-custom': 'gpt-4o-mini'
+    };
 
-        constructor(providerPools, options = {}) {
-            this.providerPools = providerPools;
-            this.globalConfig = options.globalConfig || {}; // 存储全局配置
-            this.providerStatus = {}; // Tracks health and usage for each provider instance
-            this.roundRobinIndex = {}; // Tracks the current index for round-robin selection for each provider type
-            // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
-            this.maxErrorCount = options.maxErrorCount ?? 3; // Default to 3 errors before marking unhealthy
-            this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
+    constructor(providerPools, options = {}) {
+        this.providerPools = providerPools;
+        this.globalConfig = options.globalConfig || {}; // 存储全局配置
+        this.providerStatus = {}; // Tracks health and usage for each provider instance
+        this.roundRobinIndex = {}; // Tracks the current index for round-robin selection for each provider type
+        // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
+        this.maxErrorCount = options.maxErrorCount ?? 3; // Default to 3 errors before marking unhealthy
+        this.healthCheckInterval = options.healthCheckInterval ?? 10 * 60 * 1000; // Default to 10 minutes
 
             // 日志级别控制
         this.logLevel = options.logLevel || 'info'; // 'debug', 'info', 'warn', 'error'
@@ -54,12 +58,17 @@ export class ProviderPoolManager {
             perProvider: options.globalConfig?.REFRESH_CONCURRENCY_PER_PROVIDER ?? 1 // 每个提供商内部最大并行数
         };
         
-        this.refreshQueues = {}; // 按 providerType 分组的队列
         this.activeProviderRefreshes = 0; // 当前正在刷新的提供商类型数量
         this.globalRefreshWaiters = []; // 等待全局并发槽位的任务
         
         this.warmupTarget = options.globalConfig?.WARMUP_TARGET || 0; // 默认预热0个节点
         this.refreshingUuids = new Set(); // 正在刷新的节点 UUID 集合
+        
+        this.refreshQueues = {}; // 按 providerType 分组的队列
+        // 缓冲队列机制：延迟5秒，去重后再执行刷新
+        this.refreshBufferQueues = {}; // 按 providerType 分组的缓冲队列
+        this.refreshBufferTimers = {}; // 按 providerType 分组的定时器
+        this.bufferDelay = options.globalConfig?.REFRESH_BUFFER_DELAY ?? 5000; // 默认5秒缓冲延迟
 
         this.initializeProviderStatus();
     }
@@ -75,42 +84,39 @@ export class ProviderPoolManager {
             for (const providerStatus of providers) {
                 const config = providerStatus.config;
                 
+                // 根据 providerType 确定配置文件路径字段名
+                let configPath = null;
+                if (providerType.startsWith('claude-kiro')) {
+                    configPath = config.KIRO_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('gemini-cli')) {
+                    configPath = config.GEMINI_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('gemini-antigravity')) {
+                    configPath = config.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('openai-qwen')) {
+                    configPath = config.QWEN_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('openai-iflow')) {
+                    configPath = config.IFLOW_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('openai-codex')) {
+                    configPath = config.CODEX_OAUTH_CREDS_FILE_PATH;
+                } else if (providerType.startsWith('claude-orchids')) {
+                    configPath = config.ORCHIDS_CREDS_FILE_PATH;
+                }
+                
+                // console.log(`Checking node ${providerStatus.uuid} (${providerType}) expiry date... configPath: ${configPath}`);
                 // 排除不健康和禁用的节点
                 if (!config.isHealthy || config.isDisabled) continue;
 
-                if (config.configPath && fs.existsSync(config.configPath)) {
+                if (configPath && fs.existsSync(configPath)) {
                     try {
-                        const fileContent = fs.readFileSync(config.configPath, 'utf8');
-                        const data = JSON.parse(fileContent);
-
-                        // 获取对应的适配器
-                        const tempConfig = {
-                            ...config,
-                            MODEL_PROVIDER: providerType
-                        };
-                        const serviceAdapter = getServiceAdapter(tempConfig);
-                        
-                        // 调用提供商适配器内的 isExpiryDateNear 方法
-                        let needsRefresh = false;
-                        if (typeof serviceAdapter.isExpiryDateNear === 'function') {
-                            // 适配器内部自行判断，不传参
-                            needsRefresh = serviceAdapter.isExpiryDateNear();
-                        } else {
-                            // 兜底逻辑：如果适配器没实现，使用配置数据进行判断
-                            const expiryDate = data.expiry_date || data.expires_at || data.expiry;
-                            if (expiryDate) {
-                                const expiry = new Date(expiryDate).getTime();
-                                needsRefresh = (expiry - Date.now()) < 24 * 60 * 60 * 1000;
-                            }
-                        }
-                        
-                        if (needsRefresh) {
+                        if (true) {
                             this._log('warn', `Node ${providerStatus.uuid} (${providerType}) is near expiration. Enqueuing refresh...`);
                             this._enqueueRefresh(providerType, providerStatus);
                         }
                     } catch (err) {
                         this._log('error', `Failed to check expiry for node ${providerStatus.uuid}: ${err.message}`);
                     }
+                } else {
+                    this._log('debug', `Node ${providerStatus.uuid} (${providerType}) has no valid config file path or file does not exist.`);
                 }
             }
         }
@@ -157,15 +163,103 @@ export class ProviderPoolManager {
     }
 
     /**
-     * 将节点放入刷新队列
+     * 将节点放入缓冲队列，延迟5秒后去重并执行刷新
      * @param {string} providerType 
      * @param {object} providerStatus 
+     * @param {boolean} force - 是否强制刷新（跳过缓冲队列）
      * @private
      */
     _enqueueRefresh(providerType, providerStatus, force = false) {
         const uuid = providerStatus.uuid;
+        
+        // 如果已经在刷新中，直接返回
         if (this.refreshingUuids.has(uuid)) {
             this._log('debug', `Node ${uuid} is already in refresh queue.`);
+            return;
+        }
+
+        // 判断提供商池内的总可用节点数，小于5个时，不等待缓冲，直接加入刷新队列
+        const healthyCount = this.getHealthyCount(providerType);
+        if (healthyCount < 5) {
+            this._log('info', `Provider ${providerType} has only ${healthyCount} healthy nodes. Bypassing buffer and enqueuing refresh for ${uuid} immediately.`);
+            this._enqueueRefreshImmediate(providerType, providerStatus, force);
+            return;
+        }
+
+        // 初始化缓冲队列
+        if (!this.refreshBufferQueues[providerType]) {
+            this.refreshBufferQueues[providerType] = new Map(); // 使用 Map 自动去重
+        }
+
+        const bufferQueue = this.refreshBufferQueues[providerType];
+        
+        // 检查是否已在缓冲队列中
+        const existing = bufferQueue.get(uuid);
+        const isNewEntry = !existing;
+        
+        // 更新或添加节点（保留 force: true 状态）
+        bufferQueue.set(uuid, {
+            providerStatus,
+            force: existing ? (existing.force || force) : force
+        });
+        
+        if (isNewEntry) {
+            this._log('debug', `Node ${uuid} added to buffer queue for ${providerType}. Buffer size: ${bufferQueue.size}`);
+        } else {
+            this._log('debug', `Node ${uuid} already in buffer queue, updated force flag. Buffer size: ${bufferQueue.size}`);
+        }
+
+        // 只在新增节点或缓冲队列为空时重置定时器
+        // 避免频繁重置导致刷新被无限延迟
+        if (isNewEntry || !this.refreshBufferTimers[providerType]) {
+            // 清除之前的定时器
+            if (this.refreshBufferTimers[providerType]) {
+                clearTimeout(this.refreshBufferTimers[providerType]);
+            }
+
+            // 设置新的定时器，延迟5秒后处理缓冲队列
+            this.refreshBufferTimers[providerType] = setTimeout(() => {
+                this._flushRefreshBuffer(providerType);
+            }, this.bufferDelay);
+        }
+    }
+
+    /**
+     * 处理缓冲队列，将去重后的节点放入实际刷新队列
+     * @param {string} providerType 
+     * @private
+     */
+    _flushRefreshBuffer(providerType) {
+        const bufferQueue = this.refreshBufferQueues[providerType];
+        if (!bufferQueue || bufferQueue.size === 0) {
+            return;
+        }
+
+        this._log('info', `Flushing refresh buffer for ${providerType}. Processing ${bufferQueue.size} unique nodes.`);
+
+        // 将缓冲队列中的所有节点放入实际刷新队列
+        for (const [uuid, { providerStatus, force }] of bufferQueue.entries()) {
+            this._enqueueRefreshImmediate(providerType, providerStatus, force);
+        }
+
+        // 清空缓冲队列和定时器
+        bufferQueue.clear();
+        delete this.refreshBufferTimers[providerType];
+    }
+
+    /**
+     * 立即将节点放入刷新队列（内部方法，由缓冲队列调用）
+     * @param {string} providerType 
+     * @param {object} providerStatus 
+     * @param {boolean} force 
+     * @private
+     */
+    _enqueueRefreshImmediate(providerType, providerStatus, force = false) {
+        const uuid = providerStatus.uuid;
+        
+        // 再次检查是否已经在刷新中（防止并发问题）
+        if (this.refreshingUuids.has(uuid)) {
+            this._log('debug', `Node ${uuid} is already in refresh queue (immediate check).`);
             return;
         }
 
@@ -183,31 +277,36 @@ export class ProviderPoolManager {
 
         const runTask = async () => {
             try {
-                await this._refreshNodeToken(providerType, providerStatus);
+                await this._refreshNodeToken(providerType, providerStatus, force);
             } catch (err) {
                 this._log('error', `Failed to process refresh for node ${uuid}: ${err.message}`);
             } finally {
                 this.refreshingUuids.delete(uuid);
-                queue.activeCount--;
                 
-                // 确保在异步操作中 queue 仍然存在
+                // 再次获取当前队列引用
                 const currentQueue = this.refreshQueues[providerType];
+                if (!currentQueue) return;
+
+                currentQueue.activeCount--;
                 
                 // 1. 尝试从当前提供商队列中取下一个任务
-                if (currentQueue && currentQueue.waitingTasks.length > 0) {
+                if (currentQueue.waitingTasks.length > 0) {
                     const nextTask = currentQueue.waitingTasks.shift();
                     currentQueue.activeCount++;
-                    // 使用 setImmediate 或 Promise.resolve().then 避免过深的递归
+                    // 使用 Promise.resolve().then 避免过深的递归
                     Promise.resolve().then(nextTask);
-                } else if (currentQueue && currentQueue.activeCount === 0) {
+                } else if (currentQueue.activeCount === 0) {
                     // 2. 如果当前提供商的所有任务都完成了，释放全局槽位
-                    this.activeProviderRefreshes--;
-                    delete this.refreshQueues[providerType]; // 清理空队列
+                    // 只有在确定队列为空且没有新任务时才清理
+                    if (currentQueue.waitingTasks.length === 0 &&
+                        this.refreshQueues[providerType] === currentQueue) {
+                        this.activeProviderRefreshes--;
+                        delete this.refreshQueues[providerType]; // 清理空队列
+                    }
                     
                     // 3. 尝试启动下一个等待中的提供商队列
                     if (this.globalRefreshWaiters.length > 0) {
                         const nextProviderStart = this.globalRefreshWaiters.shift();
-                        // 同样避免过深的递归
                         Promise.resolve().then(nextProviderStart);
                     }
                 }
@@ -215,7 +314,6 @@ export class ProviderPoolManager {
         };
 
         const tryStartProviderQueue = () => {
-            // 再次检查是否已经从 refreshingUuids 中移除（虽然可能性小，但为了健壮性）
             if (queue.activeCount < this.refreshConcurrency.perProvider) {
                 queue.activeCount++;
                 runTask();
@@ -225,22 +323,27 @@ export class ProviderPoolManager {
         };
 
         // 检查全局并发限制（按提供商分组）
-        // 如果该提供商已经在运行，或者全局槽位还没满，则直接开始
-        if (this.refreshQueues[providerType].activeCount > 0 || this.activeProviderRefreshes < this.refreshConcurrency.global) {
-            if (this.refreshQueues[providerType].activeCount === 0) {
-                this.activeProviderRefreshes++;
-            }
+        // 情况1: 该提供商已经在运行，直接加入其队列（不占用新的全局槽位）
+        if (this.refreshQueues[providerType].activeCount > 0) {
             tryStartProviderQueue();
-        } else {
-            // 否则进入全局等待列表
+        }
+        // 情况2: 该提供商未运行，需要检查全局槽位
+        else if (this.activeProviderRefreshes < this.refreshConcurrency.global) {
+            this.activeProviderRefreshes++;
+            tryStartProviderQueue();
+        }
+        // 情况3: 全局槽位已满，进入等待队列
+        else {
             this.globalRefreshWaiters.push(() => {
-                // 重新获取最新的队列引用，因为可能在等待期间被清理过（虽然逻辑上此时不应该被清理）
+                // 重新获取最新的队列引用
                 if (!this.refreshQueues[providerType]) {
                     this.refreshQueues[providerType] = {
                         activeCount: 0,
                         waitingTasks: []
                     };
                 }
+                // 重要：从等待队列启动时需要增加全局计数
+                this.activeProviderRefreshes++;
                 tryStartProviderQueue();
             });
         }
@@ -252,10 +355,24 @@ export class ProviderPoolManager {
      */
     async _refreshNodeToken(providerType, providerStatus, force = false) {
         const config = providerStatus.config;
-        this._log('info', `Starting token refresh for node ${providerStatus.uuid} (${providerType})`);
+        
+        // 检查刷新次数是否已达上限（最大3次）
+        const currentRefreshCount = config.refreshCount || 0;
+        if (currentRefreshCount >= 3 && !force) {
+            this._log('warn', `Node ${providerStatus.uuid} has reached maximum refresh count (3), marking as unhealthy`);
+            // 标记为不健康
+            this.markProviderUnhealthyImmediately(providerType, config, 'Maximum refresh count (3) reached');
+            return;
+        }
+        
+        // 添加5秒内的随机等待时间，避免并发刷新时的冲突
+        // const randomDelay = Math.floor(Math.random() * 5000);
+        // this._log('info', `Starting token refresh for node ${providerStatus.uuid} (${providerType}) with ${randomDelay}ms delay`);
+        // await new Promise(resolve => setTimeout(resolve, randomDelay));
 
         try {
-            config.refreshCount = (config.refreshCount || 0) + 1;
+            // 增加刷新计数
+            config.refreshCount = currentRefreshCount + 1;
 
             // 使用适配器进行刷新
             const tempConfig = {
@@ -269,9 +386,7 @@ export class ProviderPoolManager {
                 const startTime = Date.now();
                 force ? await serviceAdapter.forceRefreshToken() : await serviceAdapter.refreshToken() 
                 const duration = Date.now() - startTime;
-                this._log('info', `Token refresh successful for node ${providerStatus.uuid} (Duration: ${duration}ms)`);     
-                // 注意：根据反馈，这里不再执行健康检查验证，直接标记为健康
-                this.markProviderHealthy(providerType, config, false);
+                this._log('info', `Token refresh successful for node ${providerStatus.uuid} (Duration: ${duration}ms)`);
             } else {
                 throw new Error(`refreshToken method not implemented for ${providerType}`);
             }
@@ -293,25 +408,29 @@ export class ProviderPoolManager {
         const now = Date.now();
         
         // 1. 基础健康分：不健康的排最后
-        if (!config.isHealthy || config.isDisabled) return 1000000;
+        if (!config.isHealthy || config.isDisabled) return 1e16; 
         
-        // 2. 预热/刷新分：5分钟内刷新过且使用次数极少的节点视为“新鲜”，分数极低（最高优）
+        // 2. 预热/刷新分：2分钟内刷新过且使用次数极少的节点视为“新鲜”，分数极低（最高优）
         const isFresh = config.lastHealthCheckTime && 
-                        (now - new Date(config.lastHealthCheckTime).getTime() < 300000) && 
+                        (now - new Date(config.lastHealthCheckTime).getTime() < 120000) && 
                         (config.usageCount === 0);
-        if (isFresh) return -1000;
+        if (isFresh) return -1e16;
 
-        // 3. 时间分：LRU (最久未被使用的排前面)
-        const timeScore = config.lastUsed ? new Date(config.lastUsed).getTime() : 0;
+        // 3. 权重计算逻辑：
+        // 核心痛点：使用过一次的节点 lastUsed 变成巨大的毫秒时间戳，导致它永远比 lastUsed 为 null (0) 的节点分数高得多。
         
-        // 4. 健康检查分：最近健康检查通过的稍微优先一点
+        // 改进思路：
+        // a) 统一量级：如果没用过，我们也给它一个相对于“现在”比较旧的时间戳，而不是 0。
+        // b) 或者：使用偏移量而非绝对时间戳。
+        
+        const lastUsedTime = config.lastUsed ? new Date(config.lastUsed).getTime() : (now - 3600000); // 没用过的视为 1 小时前用过
+        const usageCount = config.usageCount || 0;
         const checkScore = config.lastHealthCheckTime ? new Date(config.lastHealthCheckTime).getTime() : 0;
-        
-        // 5. 使用次数分：使用次数少的优先
-        const usageScore = config.usageCount || 0;
 
-        // 综合得分（时间权重最大）
-        return timeScore + (usageScore * 1000) - (checkScore / 1000000);
+        // 分数计算（越小越优先）：
+        // 使用时间戳（升序 -> 越旧越优先） + 使用次数惩罚
+        // usageCount * 60000 表示每多用一次，相当于在时间排队上往后挪 1 分钟
+        return lastUsedTime + (usageCount * 60000) - (checkScore / 1e9);
     }
 
     /**
@@ -892,6 +1011,8 @@ export class ProviderPoolManager {
         if (provider) {
             provider.config.needsRefresh = false;
             provider.config.refreshCount = 0;
+            // 更新为可用
+            provider.config.lastHealthCheckTime = new Date().toISOString();
             // 标记为健康，以便立即投入使用
             this._log('info', `Reset refresh status and marked healthy for provider ${uuid} (${providerType})`);
 
@@ -1228,7 +1349,7 @@ export class ProviderPoolManager {
         }
 
         // 所有尝试都失败
-        this._log('error', `Health check failed for ${providerType} after ${maxRetries} attempts: ${lastError?.message}`);
+        this._log('error', `Health check failed for ${providerType} after ${healthCheckRequests.length} attempts: ${lastError?.message}`);
         return { success: false, modelName, errorMessage: lastError?.message || 'All health check attempts failed' };
     }
 

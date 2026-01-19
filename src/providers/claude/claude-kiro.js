@@ -31,7 +31,7 @@ const KIRO_CONSTANTS = {
     AXIOS_TIMEOUT: 120000, // 2 minutes timeout for normal requests
     TOKEN_REFRESH_TIMEOUT: 15000, // 15 seconds timeout for token refresh (shorter to avoid blocking)
     USER_AGENT: 'KiroIDE',
-    KIRO_VERSION: '0.7.5',
+    KIRO_VERSION: '0.8.140',
     CONTENT_TYPE_JSON: 'application/json',
     ACCEPT_JSON: 'application/json',
     AUTH_METHOD_SOCIAL: 'social',
@@ -404,7 +404,7 @@ export class KiroApiService {
         // 配置 HTTP/HTTPS agent 限制连接池大小，避免资源泄漏
         const httpAgent = new http.Agent({
             keepAlive: true,
-            maxSockets: 100,        // 每个主机最多 10 个连接
+            maxSockets: 100,        // 每个主机最多 100 个连接
             maxFreeSockets: 5,     // 最多保留 5 个空闲连接
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
         });
@@ -1354,8 +1354,25 @@ async saveCredentialsToFile(filePath, newData) {
 
             // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
             if (status === 403) {
-                console.log('[Kiro] Received 403. Marking credential as unhealthy...');
-                this._markCredentialUnhealthy('403 Forbidden', error);
+                console.log('[Kiro] Received 403. Marking credential as need refresh...');
+                
+                // 检查是否为 temporarily suspended 错误
+                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+                
+                if (isSuspended) {
+                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                    console.log('[Kiro] Account temporarily suspended. Marking as unhealthy without UUID refresh...');
+                    this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended', error);
+                } else {
+                    // 其他 403 错误：先刷新 UUID，然后标记需要刷新
+                    const newUuid = this._refreshUuid();
+                    if (newUuid) {
+                        console.log(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+                        this.uuid = newUuid;
+                    }
+                    this._markCredentialNeedRefresh('403 Forbidden', error);
+                }
+                
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -1862,8 +1879,25 @@ async saveCredentialsToFile(filePath, newData) {
 
             // Handle 403 (Forbidden) - mark as unhealthy immediately, no retry
             if (status === 403) {
-                console.log('[Kiro] Received 403 in stream. Marking credential as unhealthy...');
-                this._markCredentialUnhealthy('403 Forbidden', error);
+                console.log('[Kiro] Received 403 in stream. Marking credential as need refresh...');
+                
+                // 检查是否为 temporarily suspended 错误
+                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+                
+                if (isSuspended) {
+                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                    console.log('[Kiro] Account temporarily suspended in stream. Marking as unhealthy without UUID refresh...');
+                    this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended', error);
+                } else {
+                    // 其他 403 错误：先刷新 UUID，然后标记需要刷新
+                    const newUuid = this._refreshUuid();
+                    if (newUuid) {
+                        console.log(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+                        this.uuid = newUuid;
+                    }
+                    this._markCredentialNeedRefresh('403 Forbidden', error);
+                }
+
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2702,7 +2736,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
         const fullUrl = `${usageLimitsUrl}?${params.toString()}`;
 
-        // 构建请求头
+        // 动态生成 headers
         const machineId = generateMachineIdFromConfig({
             uuid: this.uuid,
             profileArn: this.profileArn,
@@ -2755,7 +2789,19 @@ async saveCredentialsToFile(filePath, newData) {
             
             if (status === 403) {
                 console.log('[Kiro] Received 403 on getUsageLimits. Marking credential as unhealthy (no retry)...');
-                this._markCredentialUnhealthy('403 Forbidden on usage query', formattedError);
+                
+                // 检查是否为 temporarily suspended 错误
+                const isSuspended = errorMessage && errorMessage.toLowerCase().includes('temporarily is suspended');
+                
+                if (isSuspended) {
+                    // temporarily suspended 错误：直接标记为不健康，不刷新 UUID
+                    console.log('[Kiro] Account temporarily suspended on usage query. Marking as unhealthy without UUID refresh...');
+                    this._markCredentialUnhealthy('403 Forbidden - Account temporarily suspended on usage query', formattedError);
+                } else {
+                    // 其他 403 错误：标记需要刷新
+                    this._markCredentialNeedRefresh('403 Forbidden on usage query', formattedError);
+                }
+                
                 throw formattedError;
             }
             
